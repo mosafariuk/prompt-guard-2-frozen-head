@@ -1466,7 +1466,8 @@ date-stamped against an actively-changing edge platform, and every *result* quan
 a reproducible benchmark harness rather than asserted — the paper specifies the experiment and lets
 measurement dictate the claims.
 
-**The deployed system is a dual-tier composition.** A multi-tenant Cloudflare edge performs the
+**The deployed system, operating as the AIO Apex enterprise firewall, is a dual-tier composition.**
+A multi-tenant Cloudflare edge performs the
 rapid, sub-millisecond screen — HMAC-SHA256 tenant binding for authenticated isolation, plus
 Aho–Corasick signature matching — and **fails open to a self-hosted origin deep-scanner** when the
 model tier is unreachable, so availability never depends on the heavier layer. That origin tier now
@@ -1733,6 +1734,25 @@ tenant key.
 > standard EUF-CMA framework — no unverified external facts. Appendix C's corpus facts
 > are CONFIRMED by direct fetch (verified-facts Part 4b) and its metrics are the
 > executed harness output.
+
+---
+
+# Data and Code Availability
+
+The Phase-5 injection-classifier pipeline is released to support reproduction of the
+99.9 % out-of-distribution result: the corpus builder and leakage-control deduplication
+(`build_corpus.py`), the frozen Prompt Guard 2 embedding extractor
+(`extract_pg2_embeddings.py`), the head-training and single-touch OOD evaluation
+(`train_head.py`, `phase5a_bis.py`, `phase5a_ter.py`), the production head finalizer
+(`finalize_head.py`), and the pre-registration protocol (`docs/phase5a_finetune_scoping.md`)
+that fixed the success criteria before any training code. All evaluation datasets are the
+license-confirmed public corpora enumerated in Appendix C. The deterministic seeds
+(20260705/06/07) reproduce the exact train / validation / OOD splits.
+
+Repository: \url{https://github.com/mosafariuk/prompt-guard-2-frozen-head}  % AIO Apex — set final URL
+
+Artifacts are additionally available from the corresponding author (mo@aioapex.com) on
+request.
 # References
 
 Consolidated bibliography. Keys are the mnemonic `\cite` labels used inline
