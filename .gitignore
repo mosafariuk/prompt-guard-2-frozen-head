@@ -22,3 +22,6 @@ benchmarks/corpus/payloads.json
 
 # original task prompt (not project content)
 primary_doc.md
+
+# submission staging (regenerable; duplicates of paper/ieee sources + PDF)
+paper/ieee/submission/

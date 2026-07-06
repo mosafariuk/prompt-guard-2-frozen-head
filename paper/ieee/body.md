@@ -1692,6 +1692,17 @@ Repository: <https://github.com/mosafariuk/prompt-guard-2-frozen-head>
 
 Artifacts are additionally available from the corresponding author (mo@aioapex.com) on
 request.
+
+---
+
+# Acknowledgment
+
+During the preparation of this manuscript, the author used Anthropic's Claude (Opus)
+as an AI assistant to support drafting, code and benchmark implementation, LaTeX
+preparation, and analysis. The author critically reviewed, edited, and verified all
+content, experimental results, and claims — including the pre-registered evaluation
+protocol and every reported number — and takes full responsibility for the integrity
+of the work. No AI system is listed as an author, consistent with IEEE authorship policy.
 # References
 
 Consolidated bibliography. Keys are the mnemonic `\cite` labels used inline
