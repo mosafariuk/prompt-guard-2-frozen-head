@@ -1,6 +1,7 @@
 # Multi-Layered Defensive Architecture and Webhook Securitization for LLM Deployment in Multi-Tenant Enterprise Systems
 
-**Authors:** [Author list] — *corresponding:* mo@selected.org
+**Author:** Mohammad Safari (AIO Apex, Brighton, United Kingdom) — *corresponding:* mo@aioapex.com
+**Code & data:** <https://github.com/mosafariuk/prompt-guard-2-frozen-head>
 **Target:** IEEE (TDSC / TIFS / S&P track). Format: IEEEtran, two-column.
 **Draft compiled:** 2026-07-04.
 
