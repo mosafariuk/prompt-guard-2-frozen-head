@@ -1,0 +1,73 @@
+Date: July 6, 2026
+
+To:
+Editor-in-Chief
+IEEE Access
+IEEE (Institute of Electrical and Electronics Engineers)
+
+Subject: Initial Submission of Original Research Manuscript for Peer Review
+
+Dear Editor-in-Chief,
+
+I am writing to submit my manuscript entitled "Multi-Layered Defensive Architecture
+and Webhook Securitization for LLM Deployment in Multi-Tenant Enterprise Systems" for
+consideration of publication in IEEE Access.
+
+This research addresses a critical and rapidly expanding vulnerability in enterprise
+SaaS platforms: the ingestion of machine-originated, attacker-influenceable webhooks
+into shared Large Language Model (LLM) contexts. While existing literature primarily
+focuses on prompt injection against conversational chatbots, this work targets the
+multi-tenant webhook vector, where the risk of cross-tenant data leakage and execution
+privilege elevation is severe.
+
+The manuscript presents a vertically integrated, multi-layered defensive architecture
+that relocates LLM webhook defense to the network edge. The core contributions are:
+
+Cryptographic Tenant Isolation: I introduce and formally prove a webhook signing
+scheme (binding tenant identifiers into HMAC-SHA256 signatures) that reduces
+cross-tenant attribution failure to HMAC's multi-user EUF-CMA security, independent of
+tenant count.
+
+Sub-Millisecond Deterministic Screening: I demonstrate a V8-isolate edge firewall
+using Aho-Corasick multi-pattern matching that executes well within the 10 ms edge CPU
+budget, with orders-of-magnitude headroom.
+
+Empirical Resolution of Model Calibration: The central empirical finding directly
+challenges current assumptions about open-weight guardrails. I show that Meta's Prompt
+Guard 2's native 22.8% out-of-distribution (OOD) recall is not a structural encoder
+limitation, but a precision-first decision-head artifact. By training a linear logistic
+head on the model's frozen penultimate embeddings under a strict, pre-registered,
+leakage-controlled protocol, I achieve 99.9% OOD recall at a 0.7% false-positive rate
+(AUC ~ 0.999). The full Phase-5 classifier pipeline has been open-sourced at
+https://github.com/mosafariuk/prompt-guard-2-frozen-head.
+
+This manuscript aligns with the multidisciplinary scope of IEEE Access, sitting at the
+intersection of network security, applied cryptography, and artificial-intelligence
+safety.
+
+Declarations:
+
+This manuscript represents original work and is not currently under consideration for
+publication in any other peer-reviewed journal or conference.
+
+Consistent with IEEE's preprint policy, I intend to deposit a preprint version of this
+manuscript to the arXiv repository (cs.CR subject class).
+
+In the interest of transparency, the manuscript discloses (in the Acknowledgment) that
+an AI assistant was used to support drafting, implementation, and analysis; all content,
+results, and claims were reviewed and verified by the author.
+
+As the sole author, I have approved this manuscript and take full responsibility for its
+content. I acknowledge the journal's open-access Article Processing Charge (APC) policy
+should the paper be accepted after peer review.
+
+Thank you for your time and for considering my research. I look forward to the
+reviewers' feedback.
+
+Sincerely,
+
+Mohammad Safari
+Senior Software Engineer / Systems Architect
+AIO Apex
+Brighton, United Kingdom
+Email: mo@aioapex.com

@@ -1,0 +1,2983 @@
+\section{I. Introduction}\label{i-introduction}
+
+\subsection{I-A. Motivation}\label{i-a-motivation}
+
+Enterprise SaaS platforms increasingly place Large Language Models
+(LLMs) on the \emph{receiving} end of webhooks. A payment-orchestration
+provider routes \passthrough{\lstinline!charge.disputed!} events into an
+LLM that drafts a merchant response; a ticketing platform feeds inbound
+\passthrough{\lstinline!issue.created!} payloads to an LLM triage agent;
+a workflow-automation vendor lets tenants wire arbitrary third-party
+events into model-backed actions. In each case the LLM is a
+\emph{shared, multi-tenant} compute resource invoked by \emph{externally
+originated, attacker-influenceable} HTTP requests. This composition is
+qualitatively more dangerous than an interactive chatbot: the input is
+machine-delivered rather than human-typed, it arrives at machine rates,
+and a single event may carry both tenant A\textquotesingle s trusted
+configuration and tenant B\textquotesingle s adversarial content into
+the same model context.
+
+Throughout this paper we use a \textbf{payment-gateway} as the running
+example because it exhibits the full hazard profile --- high request
+velocity, strong tenant-isolation requirements, regulatory exposure, and
+a webhook interface that is, by construction, reachable by parties the
+platform does not fully trust.
+
+\subsection{I-B. Problem Statement}\label{i-b-problem-statement}
+
+The prevailing defensive posture places LLM guardrails at the
+\emph{application origin}: the request traverses the public network,
+terminates at the platform\textquotesingle s backend, and only there is
+it inspected --- for prompt injection, for signature validity, for
+tenant scope. This arrangement has two structural defects.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Latency and cost are paid before rejection.} A malicious
+  webhook consumes a full network round trip and origin compute before
+  it is discarded. Under a flood, the origin absorbs the full load of
+  traffic it will ultimately reject.
+\item
+  \textbf{The trust boundary and the inspection point coincide.} The
+  component that must be protected is also the component performing the
+  protection. A parser bug or an injection that survives the guardrail
+  executes in the same trust domain as tenant data.
+\end{enumerate}
+
+A defense that inspects and authenticates requests \emph{before} they
+reach the origin --- at the network edge, in a sandboxed runtime that
+shares no state with tenant data --- addresses both. The engineering
+question this paper answers is whether such an edge defense can be made
+\textbf{cryptographically sound} (it must authenticate tenants, not
+merely filter text), \textbf{computationally cheap enough} to run inside
+a constrained edge runtime, and \textbf{observable} (every interception
+durably logged) without any of these properties gating the request path.
+
+\subsection{I-C. A Premise We Must Correct Up
+Front}\label{i-c-a-premise-we-must-correct-up-front}
+
+A recurring claim in edge-security folklore --- and in the original
+specification of this work --- is that a "standard Cloudflare Worker
+enforces a 50 ms CPU limit," and that fitting a firewall inside that
+window is the central engineering challenge. \textbf{This is incorrect
+as of 2026.} Our verification against primary Cloudflare documentation
+establishes that the 50 ms figure is a \emph{legacy artifact}: it was
+auto-applied to the deprecated "Bundled" usage model during the
+migration to Standard pricing on 2024-03-01 {[}C-pricing{]}. The current
+envelope (§III) is 10 ms of CPU per invocation on the Free plan, and on
+paid plans a default of \textbf{30 seconds}, configurable to \textbf{5
+minutes} {[}C-limits, C-changelog-2025{]}. Moreover, CPU time meters
+\emph{active computation only}; time spent awaiting network, KV, or
+database I/O is excluded {[}C-limits{]}.
+
+Two consequences follow, and we treat them as first-class contributions
+rather than footnotes. First, the design target for our deterministic
+screening layer is \textbf{sub-millisecond CPU}, which sits three to
+four orders of magnitude below even the Free-plan ceiling --- the
+engineering story is \emph{headroom}, not survival. Second, the
+"\textless50 ms" budget that genuinely matters is a \textbf{wall-clock,
+end-to-end latency SLO}, a distinct quantity from the CPU-time limit.
+Conflating the two --- as the folklore does --- produces both an
+overstated challenge and an unfalsifiable evaluation. We keep them
+separate throughout, and §III and §VII report them independently.
+
+\subsection{I-D. Contributions}\label{i-d-contributions}
+
+This paper makes the following contributions.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{An edge-relocated, multi-layered defensive architecture} for
+  LLM webhook ingestion in multi-tenant systems, in which
+  authentication, screening, and logging execute in a V8-isolate edge
+  runtime ahead of the origin (§III).
+\item
+  \textbf{A tenant-context-binding construction and its security
+  argument.} We bind a tenant identifier into an HMAC-SHA256-signed
+  message and prove, by reduction to HMAC\textquotesingle s existential
+  unforgeability under chosen-message attack (EUF-CMA), that an attacker
+  cannot present a validly-signed webhook attributed to a tenant it does
+  not control (§IV).
+\item
+  \textbf{A deterministic screening layer with explicit complexity
+  bounds.} Aho-Corasick multi-pattern matching in O(n+z) over all
+  injection signatures in a single pass, plus O(n) structural and
+  entropy scoring, with a worst-case CPU-budget accounting that
+  establishes the sub-millisecond claim against the measured §III
+  envelope (§V).
+\item
+  \textbf{A non-blocking threat-logging data path.} Interception events
+  are written out-of-band to a partitioned PostgreSQL JSONB store after
+  the response is returned, so that durable logging never appears on the
+  request\textquotesingle s critical path (§VI).
+\item
+  \textbf{An empirical evaluation} reporting p50/p90/p99 latency (CPU
+  and wall-clock reported separately) and detection efficacy ---
+  false-positive and false-negative rates --- against a documented
+  open-source prompt-injection corpus, together with the analytical
+  latency budget that the measurements test (§VII).
+\end{enumerate}
+
+As a cross-cutting contribution, we \textbf{date-stamp and correct the
+edge resource model} (I-C, §III), replacing a widely-repeated but
+obsolete constraint with the current, primary-sourced envelope.
+
+\subsection{I-E. Paper Organization}\label{i-e-paper-organization}
+
+Section II formalizes the threat model with STRIDE and fixes the
+prompt-injection and cross-tenant-leakage taxonomy. Section III
+characterizes the V8-isolate execution envelope. Section IV develops the
+cryptographic tenant-isolation construction and its proof. Section V
+specifies the heuristic screening layer and its complexity. Section VI
+details the asynchronous JSONB logging architecture. Section VII
+presents the evaluation methodology and results. Sections VIII--X cover
+related work, limitations, and conclusions.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys used above (resolved in the References
+section)}\label{citation-keys-used-above-resolved-in-the-references-section}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}C-pricing{]}} Cloudflare, "Workers Pricing,"
+  developers.cloudflare.com/workers/platform/pricing (accessed
+  2026-07-04).
+\item
+  \textbf{{[}C-limits{]}} Cloudflare, "Workers Limits,"
+  developers.cloudflare.com/workers/platform/limits (accessed
+  2026-07-04).
+\item
+  \textbf{{[}C-changelog-2025{]}} Cloudflare, "Higher CPU limits,"
+  changelog 2025-03-25.
+\end{itemize}
+
+\begin{quote}
+(\passthrough{\lstinline!paper/refs/verified-facts.md!}), Part 1 --- all
+CONFIRMED at high confidence (3-0 votes).
+\end{quote}
+
+\section{II. Threat Model and
+Taxonomy}\label{ii-threat-model-and-taxonomy}
+
+We first fix the system and adversary model (§II-A), then decompose the
+attack surface with STRIDE, applied with explicit cross-boundary
+coupling to account for the code/data confusion intrinsic to LLMs
+(§II-B). We then pin the prompt-injection taxonomy to the OWASP LLM Top
+10 (§II-C) and formalize cross-tenant leakage (§II-D).
+
+\subsection{II-A. System and Trust
+Model}\label{ii-a-system-and-trust-model}
+
+\textbf{Principals.} Let \(\mathcal{T} = \{t_1, \dots, t_N\}\) be the
+set of tenants provisioned on the platform. Each tenant \(t_i\) is
+associated with (i) a set of \emph{webhook producers} --- external
+services (payment networks, ticketing backends) authorized by \(t_i\) to
+emit events --- and (ii) a per-tenant secret \(k_i\) used to
+authenticate those events (§IV). The platform operates an \textbf{edge
+firewall} \(F\) (a V8 isolate, §III) and an \textbf{origin} \(O\) that
+hosts the shared LLM inference service \(\mathcal{M}\). A webhook is an
+HTTP request \(r\) carrying a payload \(p\) and metadata, delivered to
+\(F\), which either forwards a sanitized request to \(O\) or rejects it.
+
+\textbf{Trust boundaries.} Three boundaries matter. \textbf{B1}, the
+public network between producers and \(F\) (untrusted). \textbf{B2},
+between \(F\) and \(O\) (mutually authenticated, private). \textbf{B3},
+\emph{inside} \(\mathcal{M}\), between the model\textquotesingle s
+system/instruction context and the tenant-supplied content --- the
+boundary that prompt injection attacks. Classical architectures collapse
+B1\textquotesingle s enforcement into \(O\); we relocate it to \(F\),
+which shares no persistent state with tenant data.
+
+\textbf{Assets.} (A1) Per-tenant secrets \(k_i\). (A2) Tenant data
+resident in or reachable from \(\mathcal{M}\)\textquotesingle s context.
+(A3) The integrity of the instruction channel at B3. (A4) Availability
+and cost bounds of \(\mathcal{M}\). (A5) The non-repudiable record of
+security events.
+
+\textbf{Adversary model.} We assume a \textbf{Dolev--Yao network
+attacker} on B1 who can observe, drop, replay, reorder, and inject
+arbitrary messages, but cannot break cryptographic primitives. We
+additionally assume a \textbf{malicious-but-authenticated tenant}
+\(t_a\): a legitimate principal holding a valid \(k_a\) who attempts to
+influence another tenant \(t_b\)\textquotesingle s model interactions
+(the cross-tenant adversary). We do \emph{not} assume a compromised
+\(O\) or a broken HMAC/SHA-256; those are the trust roots. This dual
+adversary --- external forger plus insider tenant --- is what
+distinguishes multi-tenant LLM webhook security from single-tenant
+chatbot hardening.
+
+\subsection{II-B. STRIDE Decomposition with Cross-Boundary
+Coupling}\label{ii-b-stride-decomposition-with-cross-boundary-coupling}
+
+STRIDE classifies threats against \emph{data flows}, and its six
+categories were defined for systems in which the control plane (code)
+and data plane (data) are physically distinct channels. An LLM violates
+this premise: instructions and data share one natural-language channel,
+so \textbf{Tampering with the data an LLM reads becomes Elevation of
+Privilege the instant the model acts on it.} This is not a new taxonomy;
+it is an \emph{extended application} of STRIDE in which we retain the
+six canonical categories as the primary classification and additionally
+annotate the \textbf{coupling chains} (\(T\!\rightarrow\!E\),
+\(T\!\rightarrow\!I\)) --- a single event traversing two categories
+across a trust boundary --- that a flat per-category classification
+would obscure. Table I gives the decomposition over the webhook$\to$LLM
+pipeline.
+
+\textbf{TABLE I. STRIDE decomposition of the multi-tenant webhook$\to$LLM
+pipeline.}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lllllll@{}}
+\toprule
+\# & STRIDE & Threat (webhook$\to$LLM) & Asset & Trust bdy & Coupling &
+Mitigating layer \\
+\midrule
+
+
+
+1 & \textbf{S}poofing & Forged/unsigned webhook impersonating a producer
+or tenant & A1 & B1 & --- & HMAC tenant binding (§IV) \\
+2 & \textbf{T}ampering & Payload mutation in transit & A3 & B1 & --- &
+Signature over canonical payload (§IV) \\
+3 & \textbf{T}ampering$\to$\textbf{E} & Indirect injection: adversarial
+instructions embedded in retrieved/relayed content & A3 & B1,B3 &
+\(T\!\rightarrow\!E\) & Heuristic screening (§V) + isolation \\
+4 & \textbf{T}ampering$\to$\textbf{I} & Cross-tenant context poisoning:
+\(t_a\) mutates shared state later read into \(t_b\)\textquotesingle s
+context & A2,A3 & B3 & \(T\!\rightarrow\!I\) & Tenant binding (§IV) +
+per-tenant context \\
+5 & \textbf{R}epudiation & Attack occurs with no durable attribution &
+A5 & B1 & --- & Async threat log (§VI) \\
+6 & \textbf{I}nfo. disclosure & System-prompt/context extraction;
+cross-tenant leakage & A2 & B3 & --- & Screening (§V) + isolation \\
+7 & \textbf{D}oS & Token flood / CPU / subrequest exhaustion;
+"denial-of-wallet" cost amplification & A4 & B1 & --- & Edge rejection
+within CPU budget (§III,§V) \\
+8 & \textbf{E}levation & Direct injection/jailbreak executes with the
+agent\textquotesingle s tool/data privileges & A2,A3 & B3 & --- &
+Screening (§V) + least-privilege tools \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+\textbf{The lateral (multi-tenancy) axis.} Orthogonal to STRIDE, each
+threat has a \emph{same-tenant} and a \emph{cross-tenant} manifestation.
+Same-tenant injection (a tenant attacking its own model surface) is
+comparatively benign and well-studied; the platform\textquotesingle s
+obligation is the \textbf{cross-tenant} cases --- rows 4 and 6 --- where
+one tenant\textquotesingle s input compromises another\textquotesingle s
+confidentiality or integrity. We therefore treat the effective threat
+space as \(\text{STRIDE} \times \{\text{same},
+\text{cross}\}\) and prioritize the cross-tenant quadrant. This is the
+precise sense in which our contribution is \emph{multi-tenant} security
+rather than generic LLM hardening.
+
+\textbf{Why the coupling annotation matters for defense placement.}
+Because \(T\!\rightarrow\!E\) (row 3) originates as \emph{Tampering on
+B1} but detonates as \emph{Elevation at B3}, it can be intercepted at
+\emph{either} boundary. Origin-only defenses can act only at B3, after
+the model has already ingested the payload. Relocating screening to
+\(F\) lets us break the chain at B1 --- before the data ever reaches the
+channel where it can become an instruction. This is the architectural
+justification, in threat-model terms, for the edge relocation argued
+informally in §I-B.
+
+\subsection{II-C. Prompt-Injection Taxonomy (OWASP
+LLM01:2025)}\label{ii-c-prompt-injection-taxonomy-owasp-llm012025}
+
+We adopt the taxonomy of OWASP\textquotesingle s \emph{Top 10 for LLM
+Applications}, entry \textbf{LLM01: Prompt Injection}, as the
+authoritative reference {[}OWASP-LLM01{]}, corroborated in the
+literature {[}arXiv-2410.21146{]}. Prompt injection partitions into:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Direct injection.} The attacker supplies malicious
+  instructions through inputs the model processes in real time, aiming
+  to override the intended system instructions (e.g., "ignore previous
+  instructions and \ldots"). In the webhook setting, the payload body is
+  the injection vector.
+\item
+  \textbf{Indirect injection.} Adversarial instructions are embedded in
+  \emph{externally retrieved or relayed} content --- a document, a web
+  page, an upstream event field --- that the model consumes as data but
+  interprets as instruction. This is the vector for row 3 of Table I and
+  the more insidious because the injecting party need not be the
+  requesting party.
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \textbf{Stored injection} is a subcategory of indirect in which the
+    payload is persisted (e.g., in a record or knowledge base) and
+    executes on a \emph{later}, possibly different-tenant, retrieval ---
+    the mechanism underlying cross-tenant context poisoning (row 4).
+  \end{itemize}
+\end{itemize}
+
+We further sub-classify injection \emph{techniques} (jailbreak families)
+as an implementation concern of the screening layer ---
+instruction-override, role-play/persona ("DAN"-style), system-prompt
+extraction, delimiter/tag spoofing, and control-token injection --- and
+enumerate their signatures in §V and Appendix C. This taxonomy is
+\emph{verified}: the direct/indirect (with stored as an indirect
+subcategory) partition and its OWASP grounding were confirmed at high
+confidence.
+
+\subsection{II-D. Formalizing Cross-Tenant Data
+Leakage}\label{ii-d-formalizing-cross-tenant-data-leakage}
+
+Let \(c_b\) denote the model context assembled for a request on behalf
+of tenant \(t_b\): it comprises a platform system prompt \(s\),
+tenant-scoped data \(d_b\), and the request payload \(p\).
+\textbf{Cross-tenant leakage} is any execution in which information
+derived from \(d_{a}\) (\(a \neq b\)) becomes observable in the response
+to \(t_b\), or vice versa. Two failure modes generate it.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Shared-context leakage.} If context assembly places \(d_a\)
+  and \(d_b\) in the same \(c\) (e.g., a shared conversation buffer, a
+  mis-scoped retrieval, a global cache), an extraction injection (row 6)
+  in \(p\) can exfiltrate \(d_a\). Formally, isolation requires that for
+  every request on behalf of \(t_b\), \(c_b \cap d_a = \emptyset\) for
+  all \(a \neq b\) --- a property the \emph{architecture}, not the
+  model, must guarantee.
+\item
+  \textbf{Shared-key attribution failure.} If a single secret \(k\)
+  authenticates all tenants, a valid signature proves only that
+  \emph{some} authorized party sent the event, not \emph{which} tenant.
+  An attacker (or a confused-deputy producer) can then present content
+  that the origin attributes to the wrong tenant, causing \(p\) authored
+  under \(t_a\)\textquotesingle s authority to execute in \(c_b\).
+  Preventing this is exactly the tenant-\emph{binding} property we
+  construct and prove in §IV: the signature must authenticate not just
+  \emph{authenticity} but \emph{tenant identity}.
+\end{enumerate}
+
+These two modes motivate the two independent controls the architecture
+provides --- per-tenant context isolation at the origin (assumed, and
+out of scope for the edge firewall) and per-tenant cryptographic binding
+at the edge (§IV, our contribution). The threat model thus reduces the
+cross-tenant obligation to a property we can state and prove
+cryptographically, which §IV does.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys}\label{citation-keys}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}OWASP-LLM01{]}} OWASP, "LLM01:2025 Prompt Injection," Top
+  10 for LLM Applications,
+  genai.owasp.org/llmrisk/llm01-prompt-injection.
+\item
+  \textbf{{[}arXiv-2410.21146{]}} "\emph{(indirect/stored injection
+  taxonomy)}," arXiv:2410.21146.
+\end{itemize}
+
+\begin{quote}
+decomposition and cross-tenant formalization in §II-A/B/D are original
+analytical framing built on the verified taxonomy; they assert no
+unverified external facts.
+\end{quote}
+
+\section{III. Edge Interception Layer: The V8 Isolate Execution
+Envelope}\label{iii-edge-interception-layer-the-v8-isolate-execution-envelope}
+
+This section characterizes the runtime in which the firewall executes
+and converts its published resource limits into an \emph{operation
+budget} against which §V\textquotesingle s algorithms are checked. We
+first describe the isolate execution model (§III-A), fix the resource
+envelope from primary sources (§III-B), derive the cost model and budget
+(§III-C), restate the CPU/wall-clock correction and its consequences
+(§III-D), and give the reverse-proxy dataflow (§III-E).
+
+\subsection{III-A. The Isolate Execution
+Model}\label{iii-a-the-isolate-execution-model}
+
+Cloudflare Workers execute in \textbf{V8 isolates} rather than
+per-request containers or processes. An isolate is a lightweight,
+memory-safe sandbox within a shared V8 runtime; thousands coexist in one
+OS process, and a single isolate serves \emph{many} concurrent requests.
+This has three consequences that shape the firewall\textquotesingle s
+design.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{No per-request process spin-up.} Unlike a
+  container-per-request model, isolate reuse means module-scope
+  initialization (parsing configuration, \emph{building the
+  Aho--Corasick automaton}) executes once when the isolate is created
+  and is then amortized across every request that isolate serves. Only
+  work performed \emph{inside} the request handler counts against
+  per-request CPU.
+\item
+  \textbf{Cold start vs. warm path.} A request routed to a location with
+  no warm isolate pays a one-time initialization cost (the module
+  top-level), after which the isolate stays warm and subsequent requests
+  skip it. Our design places all heavy precomputation at module top
+  level precisely so that it is paid at most once per isolate lifetime,
+  never on the warm request path.
+\item
+  \textbf{Single-threaded, event-loop concurrency.} Each isolate runs
+  JavaScript on a single thread; concurrency is cooperative via the
+  event loop. CPU-bound work therefore \emph{blocks} the isolate for its
+  duration, which is why the per-request CPU cost of screening must be
+  small in absolute terms, not merely asymptotically linear. This
+  motivates the operation-budget analysis of §III-C.
+\end{enumerate}
+
+The isolate model also underlies the memory constraint: because one
+isolate hosts many requests, the 128 MB cap (§III-B) is a
+\emph{per-isolate}, not per-request, limit, and long-lived module-scope
+structures (the automaton, signature tables) are counted against it
+once, not per request.
+
+\subsection{III-B. The Resource
+Envelope}\label{iii-b-the-resource-envelope}
+
+Table II fixes the operative limits from primary Cloudflare
+documentation. \textbf{Every figure is date-stamped (accessed
+2026-07-04); the platform revises these quarterly, and any reuse of this
+table must re-verify.}
+
+\textbf{TABLE II. Cloudflare Workers resource envelope (accessed
+2026-07-04).}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llll@{}}
+\toprule
+Resource & Free plan & Paid (Standard) plan & Source \\
+\midrule
+
+
+
+CPU time / invocation & \textbf{10 ms} & \textbf{30 s default},
+configurable to \textbf{300 s (5 min)} via
+\passthrough{\lstinline!limits.cpu\_ms!} & {[}C-limits{]},
+{[}C-changelog-2025{]} \\
+Wall-clock duration (HTTP trigger) & no hard limit & no hard limit / no
+charge & {[}C-limits{]}, {[}C-pricing{]} \\
+Memory / isolate & 128 MB & 128 MB & {[}C-limits{]} \\
+Subrequests / invocation & 50 external + 1,000 to CF services &
+\textbf{10,000 default} (to 10 M), since 2026-02-11 & {[}C-limits{]},
+{[}C-changelog-2026{]} \\
+I/O wait counted as CPU? & \textbf{No} & \textbf{No} & {[}C-limits{]} \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+Three properties of this envelope are decisive for the architecture:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{CPU time excludes I/O wait.} Time awaiting the
+  \passthrough{\lstinline!fetch!} to the origin LLM, a KV read for a
+  nonce (§IV), or the database write (§VI) does \emph{not} accrue
+  against the CPU limit {[}C-limits{]}. Consequently the
+  firewall\textquotesingle s CPU budget is consumed \emph{only} by local
+  computation --- signature scanning, HMAC verification, sanitization
+  --- and not by the network operations that dominate wall-clock time.
+\item
+  \textbf{Wall-clock is effectively unbounded for HTTP-triggered
+  Workers.} The webhook path is HTTP-triggered, so there is no duration
+  cap to design against; the "\textless50 ms" target (§VII) is a
+  self-imposed \emph{latency SLO}, not a platform limit.
+\item
+  \textbf{The subrequest budget is ample.} Forwarding to origin plus at
+  most a small constant number of KV/queue operations per request sits
+  far within even the Free-plan 50-external ceiling.
+\end{itemize}
+
+\subsection{III-C. From CPU Limit to Operation
+Budget}\label{iii-c-from-cpu-limit-to-operation-budget}
+
+Asymptotic complexity bounds \emph{scaling} but not \emph{absolute}
+latency; a linear algorithm with a large constant on an unbounded input
+can exceed any fixed budget. A defensible sub-millisecond guarantee
+therefore requires three ingredients: (i) a hard bound on input size,
+(ii) a per-operation constant on the target runtime, and (iii) a
+worst-case operation count. We supply (i) and (iii) here analytically
+and pin (ii) empirically in §VII.
+
+\textbf{Operation budget.} Let \(\rho\) (operations $\cdot$ ms\(^{-1}\)) be
+the effective scalar-operation throughput of the edge V8 runtime for the
+byte-scanning workload of §V, and let \(L_{\text{CPU}}\) be the
+per-invocation CPU limit. The available operation budget for one request
+is \fiteq{B = \rho \cdot L_{\text{CPU}}.} On the Free plan,
+\(L_{\text{CPU}} = 10\text{ ms}\); on paid plans the \emph{default} is
+\(L_{\text{CPU}} =
+30{,}000\text{ ms}\). We deliberately evaluate the firewall against the
+\textbf{Free-plan} budget as the worst case --- if screening fits in 10
+ms of CPU, it fits everywhere. \(\rho\) is left symbolic here and
+measured in §VII; the analysis below yields a bound of the form
+"\(C_{\text{req}}/B\)" that is independent of \(\rho\)\textquotesingle s
+exact value once \(\rho\) is known.
+
+\textbf{Input bound.} The firewall rejects any request whose body
+exceeds a configured maximum \(N_{\max}\) bytes \emph{before} invoking
+the scanner (Algorithm in §V). Oversized-payload rejection is
+simultaneously (a) a precondition for the latency guarantee and (b) a
+DoS control (Table I, row 7). We take \(N_{\max}\) as a deployment
+parameter (default 128 KiB in our implementation, §V/Phase 2).
+
+\textbf{Per-request cost.} Under the isolate model (§III-A), the
+O(\(m\)) Aho--Corasick construction over total signature length \(m\)
+executes once at module init and contributes \textbf{zero} to the
+per-request budget. The per-request work is therefore:
+\fiteq{C_{\text{req}} \;\le\; \underbrace{c_{\text{ac}}\,(N_{\max} + z)}_{\text{signature scan (§V-B)}}
+\;+\; \underbrace{k\,c_{\text{lin}}\,N_{\max}}_{k \text{ linear feature passes (§V-C)}}
+\;+\; \underbrace{c_{\text{hmac}}\,N_{\max}}_{\text{HMAC over payload (§IV)}},}
+where \(z \le N_{\max}\) is the number of signature matches (bounded by
+input length and further capped by early-exit, §V-B), \(k\) is the fixed
+number of linear feature passes (entropy, structural --- a small
+constant, \(k \le 4\)), and \(c_{\bullet}\) are per-byte constants.
+Since \(z \le N_{\max}\), this simplifies to
+\fiteq{C_{\text{req}} \;\le\; \big(2c_{\text{ac}} + k\,c_{\text{lin}} + c_{\text{hmac}}\big)\,N_{\max}
+\;=\; \kappa\, N_{\max},} a \textbf{constant \(\kappa\) times a bounded
+input} --- the only form that supports an absolute latency claim. The
+sub-millisecond guarantee is then the assertion
+\(\kappa N_{\max} \ll B\), i.e.
+\fiteq{\frac{C_{\text{req}}}{B} = \frac{\kappa N_{\max}}{\rho\,L_{\text{CPU}}} \ll 1,}
+which §VII establishes by measuring \(\kappa/\rho\) (the wall-normalized
+per-byte cost) and evaluating at \(N_{\max} = 128\text{ KiB}\),
+\(L_{\text{CPU}} = 10\text{ ms}\). The critical structural point,
+provable \emph{without} the constant, is that per-request cost is
+\textbf{strictly linear in a bounded input with all superlinear and
+one-time work excluded} --- there is no per-request construction, no
+backtracking (Aho--Corasick is backtrack-free), and no unbounded loop.
+
+\subsection{III-D. The CPU/Wall-Clock Correction and Its
+Consequences}\label{iii-d-the-cpuwall-clock-correction-and-its-consequences}
+
+As established in §I-C, the commonly cited "50 ms Worker CPU limit" is a
+\textbf{legacy artifact} of the deprecated Bundled usage model,
+auto-applied during the 2024-03-01 migration to Standard pricing
+{[}C-pricing{]}; it is not the contemporary envelope. Table II
+supersedes it. Two engineering consequences follow directly and are
+exploited by the architecture:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{The screening layer runs with vast headroom, not at the
+  margin.} Against a 10 ms Free-plan CPU ceiling --- and 30,000 ms on
+  paid plans --- a \(\kappa N_{\max}\) cost on a 128 KiB bound is orders
+  of magnitude under budget (§VII quantifies the ratio). The design
+  problem is not "fit inside a tight CPU limit" but "spend a tiny,
+  \emph{bounded} fraction of an ample budget so that screening is
+  invisible in the wall-clock latency envelope."
+\item
+  \textbf{I/O is free against the CPU budget, so decoupling is natural.}
+  Because awaiting the origin \passthrough{\lstinline!fetch!} and the
+  threat-log write does not accrue CPU (§III-B), the firewall can
+  forward the request and hand off logging (§VI) without those
+  operations competing with screening for the CPU limit. The CPU limit
+  constrains \emph{only} the local inspection, which §III-C has bounded.
+\end{enumerate}
+
+\subsection{III-E. Reverse-Proxy
+Dataflow}\label{iii-e-reverse-proxy-dataflow}
+
+The firewall is a reverse proxy on the request path (Fig. 1). For each
+inbound webhook:
+
+\begin{lstlisting}
+                         +------------------------ Edge Isolate F -----------------------+
+ Producer --HTTP(B1)-->  |  (1) size guard: reject if |body| > N_max        [O(1)]        |
+                         |  (2) HMAC-SHA256 verify + tenant binding (§IV)   [c_hmac$\cdot$N]     |
+                         |  (3) canonicalize + sanitize input (§V-E)        [O(N)]         |
+                         |  (4) Aho–Corasick signature scan (§V-B)          [c_ac$\cdot$(N+z)]   |
+                         |  (5) structural + entropy scoring (§V-C)         [k$\cdot$c_lin$\cdot$N]    |
+                         |  (6) decision: forward | reject                  [O(1)]         |
+                         |        | forward (B2)                                            |
+                         |        v                                                         |
+                         |   fetch $\to$ Origin O / model M   -- I/O, not CPU --> response      |
+                         |        |                                                         |
+                         |  (7) ctx.waitUntil(logThreat(...))  -- async, post-response -->  |--> PostgreSQL (§VI)
+                         +---------------------------------------------------------------+
+\end{lstlisting}
+
+\textbf{Fig. 1.} Request lifecycle in the edge isolate. Steps (1)--(6)
+are the CPU-bounded critical path analyzed in §III-C; the origin
+\passthrough{\lstinline!fetch!} and the
+\passthrough{\lstinline!waitUntil!}-deferred threat log (§VI) are I/O
+and do not accrue against the CPU limit. Steps (2), (4), (5) are the
+substance of §IV and §V; the size guard (1) supplies the \(N_{\max}\)
+bound that makes the latency analysis absolute.
+
+The ordering is security-critical: authentication (step 2) precedes
+screening (steps 3--5), so unauthenticated traffic is rejected before
+any content-inspection cost is incurred, and the size guard (step 1)
+precedes everything, so no unbounded input reaches any linear pass.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys}\label{citation-keys-1}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}C-limits{]}} Cloudflare, "Workers --- Limits,"
+  developers.cloudflare.com/workers/platform/limits (accessed
+  2026-07-04).
+\item
+  \textbf{{[}C-pricing{]}} Cloudflare, "Workers --- Pricing,"
+  developers.cloudflare.com/workers/platform/pricing (accessed
+  2026-07-04).
+\item
+  \textbf{{[}C-changelog-2025{]}} Cloudflare, "Higher CPU limits for
+  Workers," changelog, 2025-03-25.
+\item
+  \textbf{{[}C-changelog-2026{]}} Cloudflare, "Increased subrequest
+  limits," changelog, 2026-02-11.
+\end{itemize}
+
+\begin{quote}
+3-0). The cost model (§III-C) is original analysis; the constant
+\(\rho\) (and hence \(\kappa/\rho\)) is deferred to empirical
+measurement in §VII and asserted nowhere as a literature value.
+\end{quote}
+
+\section{IV. Cryptographic Tenant
+Isolation}\label{iv-cryptographic-tenant-isolation}
+
+Section II-D reduced the cross-tenant obligation to a cryptographic
+property: a webhook must authenticate not merely \emph{authenticity}
+("some authorized party sent this") but \emph{tenant identity} ("tenant
+\(t_b\) authorized this"). This section discharges that obligation. We
+fix MAC preliminaries (§IV-A), define the tenant-bound signing scheme
+(§IV-B), prove tenant binding for static keys (§IV-C, Theorem 1), lift
+the result to key rotation (§IV-D, Theorem 2), and treat replay as an
+orthogonal freshness property (§IV-E). §IV-F states why the tenant
+identifier must reside \emph{inside} the signed message.
+
+\subsection{IV-A. Preliminaries: MACs, EUF-CMA, and
+HMAC}\label{iv-a-preliminaries-macs-euf-cma-and-hmac}
+
+\textbf{MAC syntax.} A message authentication code is a triple
+\(\Pi=(\mathsf{KGen},\mathsf{Mac},
+\mathsf{Vrfy})\): \(\mathsf{KGen}\) outputs a key \(k\in\{0,1\}^n\);
+\(\mathsf{Mac}_k(m)\to\tau\) produces a tag;
+\(\mathsf{Vrfy}_k(m,\tau)\in\{0,1\}\) verifies. Correctness requires
+\(\mathsf{Vrfy}_k(m,\mathsf{Mac}_k(m))=1\) for all \(k,m\).
+
+\textbf{EUF-CMA.} Existential unforgeability under chosen-message attack
+is defined by the game
+\(\mathbf{Exp}^{\text{euf-cma}}_{\Pi}(\mathcal{A})\):
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Challenger runs \(k\leftarrow\mathsf{KGen}(1^n)\) and initializes
+  \(\mathcal{Q}\leftarrow\emptyset\).
+\item
+  \(\mathcal{A}\) is given oracle access to \(\mathsf{Mac}_k(\cdot)\)
+  (each query \(m\) appended to \(\mathcal{Q}\)) and
+  \(\mathsf{Vrfy}_k(\cdot,\cdot)\).
+\item
+  \(\mathcal{A}\) outputs \((m^*,\tau^*)\).
+\item
+  \(\mathcal{A}\) \textbf{wins} iff
+  \(\mathsf{Vrfy}_k(m^*,\tau^*)=1 \wedge m^*\notin\mathcal{Q}\).
+\end{enumerate}
+
+The advantage is
+\(\mathbf{Adv}^{\text{euf-cma}}_{\Pi}(\mathcal{A})=\Pr[\mathcal{A}\text{ wins}]\),
+and \(\Pi\) is EUF-CMA-secure if this is negligible for all PPT
+\(\mathcal{A}\). \textbf{The freshness condition
+\(m^*\notin\mathcal{Q}\) is essential and is precisely why
+unforgeability says nothing about replay of an already-signed message}
+(§IV-E).
+
+\textbf{HMAC.} For a hash \(H\) with block length \(B\),
+\(\mathsf{HMAC}_k(m)=H\big((k'\oplus\mathrm{opad})\,\|\,
+H((k'\oplus\mathrm{ipad})\,\|\,m)\big)\), with
+\(\mathrm{ipad}=\texttt{0x36}^B\), \(\mathrm{opad}=\texttt{0x5C}^B\),
+and \(k'\) the key zero-padded to \(B\) bytes {[}RFC2104{]},
+{[}FIPS198-1{]}. We rely on the standard result that HMAC is a
+pseudorandom function (PRF) when the underlying compression function is
+a PRF {[}BCK96{]}, and that any PRF is an EUF-CMA-secure MAC with
+\[\mathbf{Adv}^{\text{euf-cma}}_{\mathsf{HMAC}}(\mathcal{A}) \;\le\;
+\mathbf{Adv}^{\text{prf}}_{\mathsf{HMAC}}(\mathcal{B}) + 2^{-n},\tag{1}\]
+where \(n\) is the tag length in bits (for HMAC-SHA256, \(n=256\), so
+\(2^{-n}\) is cryptographically negligible). We treat (1) as a trust
+root (§II-A) and reduce all subsequent claims to it.
+
+\textbf{Multi-user security.} Because a multi-tenant deployment
+instantiates \(u\) \emph{independent} keys (one per tenant, or per
+tenant-epoch under rotation), the operative notion is \emph{multi-user}
+security. In the multi-user PRF (mu-PRF) game, \(\mathcal{A}\) interacts
+with \(u\) independent instances and distinguishes them jointly from
+\(u\) random functions; in the multi-user EUF-CMA (mu-EUF-CMA) game,
+\(\mathcal{A}\) wins by producing a forgery under \emph{any} one of the
+\(u\) instances. The naive hybrid bound loses a factor \(u\),
+\(\mathbf{Adv}^{\text{mu-prf}}_{\mathsf{HMAC},u}\le u\cdot\mathbf{Adv}^{\text{prf}}_{\mathsf{HMAC}}\),
+which is unacceptable when \(u\) scales to \(10^5\)--\(10^6\) tenants.
+We instead invoke the \emph{tight} multi-user analysis of HMAC
+{[}BBT16{]}, under which
+\[\mathbf{Adv}^{\text{mu-euf-cma}}_{\mathsf{HMAC},u}(\mathcal{A})\;\le\;
+\mathbf{Adv}^{\text{mu-prf}}_{\mathsf{HMAC},u}(\mathcal{A})+Q_v\,2^{-n},\tag{2}\]
+where the mu-PRF term \textbf{carries no linear-in-\(u\) factor} --- it
+is bounded by the adversary\textquotesingle s \emph{aggregate} query
+budget and a birthday term, independent of the number of instances ---
+and \(Q_v\) is the number of verification queries. Equations (1)--(2)
+are the only cryptographic assumptions used below.
+
+\subsection{IV-B. The Tenant-Bound Webhook Signing
+Scheme}\label{iv-b-the-tenant-bound-webhook-signing-scheme}
+
+For tenant \(t_i\) holding key \(k_{i,\kappa}\) under key-id \(\kappa\),
+define the \textbf{canonical signed message}
+\fiteq{m \;=\; \mathsf{tid}_i \,\|\, \kappa \,\|\, t_s \,\|\, \eta \,\|\, H_{\text{body}},}
+where \(\mathsf{tid}_i\) is the tenant identifier, \(\kappa\) the
+key-id, \(t_s\) a Unix timestamp, \(\eta\) a random nonce (\(\lambda\)
+bits), and \(H_{\text{body}}=\mathsf{SHA256}(\text{payload})\) a digest
+binding the body. The transmitted signature is
+\(\tau=\mathsf{HMAC}_{k_{i,\kappa}}(m)\), sent with
+\((\mathsf{tid}_i,\kappa,t_s,\eta)\) in headers. Each field is
+length-prefixed (or delimited by a byte absent from the field alphabet)
+so that the encoding is injective --- no two distinct field tuples share
+a serialization, foreclosing canonicalization-ambiguity attacks. This
+mirrors the Stripe scheme (signed payload \(=\)
+\passthrough{\lstinline!timestamp . "." . body!},
+\passthrough{\lstinline!v1=HMAC-SHA256!}) {[}Stripe-sig{]} but
+additionally binds \(\mathsf{tid}_i\) and \(\kappa\).
+
+Verification at the edge (Fig. 1, step 2): recompute
+\(\tau'=\mathsf{HMAC}_{k_{i,\kappa}}(m)\) using the key selected by
+\((\mathsf{tid}_i,\kappa)\) and accept iff \(\tau'=\tau\) under a
+constant-time comparison (to avoid timing side channels), the timestamp
+is fresh, and the nonce is unseen (§IV-E).
+
+\subsection{IV-C. Tenant Binding under Static Keys (Theorem
+1)}\label{iv-c-tenant-binding-under-static-keys-theorem-1}
+
+\textbf{Tenant-binding game} \(\mathbf{Exp}^{\text{bind}}\). Let each
+tenant \(t_i\in\mathcal{T}\) have an independent key
+\(k_i\leftarrow\mathsf{KGen}(1^n)\) (single key per tenant in this
+subsection). The adversary \(\mathcal{A}\):
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  selects a corrupt set \(\mathcal{C}\subset\mathcal{T}\) and receives
+  \(\{k_i : t_i\in\mathcal{C}\}\);
+\item
+  for every uncorrupted tenant \(t_j\notin\mathcal{C}\), obtains oracle
+  access to \(\mathsf{Mac}_{k_j}(\cdot)\) (this over-approximates the
+  Dolev--Yao capability: observing \(t_j\)\textquotesingle s legitimate
+  webhooks is a \emph{known}-message attack, a special case of
+  chosen-message);
+\item
+  outputs a target \(t_b\notin\mathcal{C}\) and a pair
+  \((m^*,\tau^*)\) with \(\mathsf{tid}(m^*)=
+  \mathsf{tid}_b\).
+\end{enumerate}
+
+\(\mathcal{A}\) \textbf{wins} iff
+\(\mathsf{Vrfy}_{k_b}(m^*,\tau^*)=1\) and \(m^*\) was never returned
+by \(t_b\)\textquotesingle s signing oracle. Intuitively: the attacker,
+even owning every other tenant\textquotesingle s key and seeing all of
+\(t_b\)\textquotesingle s traffic, produces a \emph{new} webhook that
+the system attributes to \(t_b\).
+
+\begin{quote}
+\textbf{Theorem 1 (Tenant binding, static keys --- multi-user).} Let
+\(u=|\mathcal{T}\setminus
+\mathcal{C}|\) be the number of uncorrupted tenants. For the scheme of
+§IV-B with independent per-tenant keys and any PPT adversary
+\(\mathcal{A}\), there exists a PPT \(\mathcal{B}\) with
+\fiteq{\mathbf{Adv}^{\text{bind}}(\mathcal{A}) \;\le\;
+\mathbf{Adv}^{\text{mu-euf-cma}}_{\mathsf{HMAC},u}(\mathcal{B})
+\;\le\; \mathbf{Adv}^{\text{mu-prf}}_{\mathsf{HMAC},u}(\mathcal{B})+Q_v\,2^{-n}.}
+By the tight multi-user security of HMAC (Eq. 2, {[}BBT16{]}) the
+right-hand side is \textbf{independent of the tenant-pool size \(u\)}
+--- it is bounded by \(\mathcal{A}\)\textquotesingle s aggregate query
+budget and a birthday term, not by the number of tenants.
+\end{quote}
+
+\emph{Proof (multi-user reduction, no target guessing).} \(\mathcal{B}\)
+plays mu-EUF-CMA against the \(u\) uncorrupted-tenant instances
+\(\{k_j : t_j\notin\mathcal{C}\}\). It generates the corrupt
+tenants\textquotesingle{} keys itself and answers their key-reveal and
+signing queries directly; each signing query for an uncorrupted \(t_j\)
+is forwarded to instance \(j\)\textquotesingle s \(\mathsf{Mac}\)
+oracle, recording the queried \(m\). When \(\mathcal{A}\) halts with
+\((m^*,\tau^*)\) where \(\mathsf{tid}(m^*)=\mathsf{tid}_b\) for some
+uncorrupted \(t_b\) and \(m^*\) was never signed by \(t_b\), then ---
+because the encoding is injective and \(\mathsf{tid}\) occupies a fixed
+field --- \((b, m^*,\tau^*)\) is verbatim a valid forgery under
+instance \(b\) with \(m^*\) fresh for that instance: a win in the
+mu-EUF-CMA game. \textbf{No guess of the target is required}, because a
+forgery under \emph{any} uncorrupted instance already wins the
+multi-user game; this is exactly what removes the factor-\(u\) loss. The
+second inequality is the generic mu-PRF \(\Rightarrow\) mu-MAC step (Eq.
+2). \(\square\)
+
+The theorem formalizes the §II-D requirement: because \(\mathsf{tid}_i\)
+is \emph{inside} the MAC input, attributing a webhook to \(t_b\) is
+exactly as hard as forging HMAC in the multi-user game --- independent
+of how many \emph{other} tenant keys the adversary holds \emph{and}
+independent of the tenant population. This is the shared-key attribution
+failure (§II-D, mode 2) provably eliminated, with a bound that does not
+degrade at enterprise scale.
+
+\subsection{IV-D. Key Rotation in the Formal Model (Theorem
+2)}\label{iv-d-key-rotation-in-the-formal-model-theorem-2}
+
+Static keys are unrealistic: keys must rotate for compromise recovery
+and hygiene. We model rotation without abandoning Theorem 1.
+
+\textbf{Rotation model.} Each tenant maintains a set of keys
+\(\{k_{i,\kappa}\}\) indexed by key-id \(\kappa\), each with a validity
+window \([\,a_\kappa, b_\kappa\,)\). Windows \emph{overlap}: when
+rotating from \(\kappa\) to \(\kappa+1\), both are valid for a rollover
+interval, so in-flight producers signing under the old key are not
+rejected. Let \(L=\max_i \max_t |\{\kappa : t\in[a_\kappa,b_\kappa)\}|\)
+be the maximum number of simultaneously valid keys for any tenant at any
+time (typically \(L=2\)). The verifier selects the key by the
+\emph{authenticated} \(\kappa\) carried in \(m\) and accepts iff the tag
+validates under \(k_{i,\kappa}\) and \(\kappa\) is currently valid.
+
+\begin{quote}
+\textbf{Theorem 2 (Tenant binding under rotation).} Let
+\(u'=\sum_{t_i\notin\mathcal{C}}
+|\{\kappa : k_{i,\kappa}\text{ currently valid}\}| \le uL\) be the total
+number of simultaneously-valid uncorrupted keys. Then
+\fiteq{\mathbf{Adv}^{\text{bind-rot}}(\mathcal{A}) \;\le\;
+\mathbf{Adv}^{\text{mu-euf-cma}}_{\mathsf{HMAC},u'}(\mathcal{B})
+\;\le\; \mathbf{Adv}^{\text{mu-prf}}_{\mathsf{HMAC},u'}(\mathcal{B})+Q_v\,2^{-n},}
+which by Eq. 2 is \textbf{independent of both \(u\) and the overlap
+multiplicity \(L\)}.
+\end{quote}
+
+\emph{Proof (each valid key is an instance).} Treat every
+currently-valid uncorrupted pair \((t_i,\kappa)\) as one of \(u'\)
+independent mu-EUF-CMA instances. The rotation verifier accepts a
+\(t_b\)-attributed message iff its tag validates under \emph{some} valid
+\((t_b,\kappa)\) --- i.e., iff it is a forgery under one of those
+instances. The reduction of Theorem 1 applies verbatim with the instance
+set enlarged from \(u\) to \(u'\): a win for \(\mathcal{A}\) is a
+forgery under some instance, winning the mu-EUF-CMA game with no target
+or key guess. Because the tight multi-user bound (Eq. 2) has no
+linear-in-instance-count factor, enlarging \(u\to u'\le uL\) does not
+degrade the bound. \(\square\)
+
+\textbf{Consequences and strategy.} (i) Under the tight multi-user bound
+the security is independent of the overlap multiplicity \(L\); \(L\)
+affects only \emph{operational} exposure, not the reduction. Keeping the
+rollover interval short still matters because it bounds the
+\emph{compromise window} (iii), not the advantage. (Under the weaker
+generic bound one would pay a factor \(u'\le uL\); we avoid this via
+{[}BBT16{]}.) (ii) Because \(\kappa\) is authenticated inside \(m\), an
+attacker cannot force verification under a \emph{revoked} key (a
+downgrade): tampering with \(\kappa\) breaks the tag. (iii) On
+compromise of \(k_{i,\kappa}\), the operator advances \(\kappa\) and
+shrinks the old window to \(\{\)now\(\}\); the exposure is bounded by
+the rollover interval. Keys are stored in the edge secret store / KV and
+selected by \((\mathsf{tid}_i,\kappa)\) at verification; retrieval is
+I/O, not CPU (§III-B). (iv) Forward secrecy is \emph{not} claimed: HMAC
+keys are symmetric, so a leaked \(k_{i,\kappa}\) forges messages within
+\(\kappa\)\textquotesingle s window. Rotation bounds, but does not
+retroactively protect, that window.
+
+\subsection{IV-E. Replay Resistance as an Orthogonal Freshness
+Property}\label{iv-e-replay-resistance-as-an-orthogonal-freshness-property}
+
+Theorem 1\textquotesingle s freshness clause (\(m^*\notin\mathcal{Q}\))
+means a \emph{replayed} legitimate webhook \((m,\tau)\) --- where \(m\)
+\emph{was} signed by \(t_b\) --- is \textbf{not} an unforgeability
+break. Replay is a distinct property requiring freshness, which the
+\(t_s\) and \(\eta\) fields provide.
+
+\textbf{Freshness game.} The verifier maintains a nonce cache
+\(\mathcal{N}\) and accepts \((m,\tau)\) only if: (a) \(\tau\) verifies
+(§IV-C); (b) \(|t_{\text{now}}-t_s|\le\Delta\) (timestamp tolerance);
+and (c) \(\eta\notin\mathcal{N}\), after which \(\eta\) is inserted with
+TTL \(2\Delta\). An adversary replaying a captured \((m,\tau)\) succeeds
+only if it arrives (i) within \(\Delta\) of \(t_s\) \emph{and} (ii) with
+\(\eta\) already evicted from \(\mathcal{N}\). But \(\mathcal{N}\)
+retains every nonce for \(2\Delta\ge\Delta\), so within the timestamp
+window the nonce is necessarily still present and the replay is
+rejected; outside the window the timestamp check rejects it. Hence
+\fiteq{\Pr[\text{replay accepted}] \;\le\; \Pr[\text{nonce-store loss within }2\Delta]\;+\;2^{-\lambda},}
+where the first term is the probability the nonce store fails to retain
+\(\eta\) over the window (an availability parameter of the KV/DO store)
+and \(2^{-\lambda}\) bounds an accidental nonce collision causing false
+eviction. With \(\lambda=128\) the collision term is negligible, so
+replay resistance reduces to nonce-store reliability over \(2\Delta\).
+
+\textbf{Parameterization and cost.} \(\Delta\) trades replay window
+against tolerance to clock skew and producer/delivery latency; Stripe
+uses \(\Delta=300\text{ s}\) by default {[}Stripe-sig{]}, which we adopt
+as a baseline. The nonce check is a single keyed lookup in edge KV or a
+Durable Object; it is a subrequest (I/O), so it does \textbf{not}
+consume the CPU budget of §III-C --- replay defense is free against the
+sub-millisecond screening analysis. A stateless fallback
+(timestamp-only, no nonce) degrades to "at-most-one replay per
+\(\Delta\) window per message" and is offered as a lower-assurance mode
+when KV latency is unacceptable.
+
+\subsection{IV-F. Why the Tenant Identifier Must Be Inside the
+Signature}\label{iv-f-why-the-tenant-identifier-must-be-inside-the-signature}
+
+If \(\mathsf{tid}_i\) were transmitted only as an \emph{unauthenticated}
+header (outside \(m\)), an attacker holding any single valid
+\((m,\tau)\) under key \(k\) could attach an arbitrary \(\mathsf{tid}\)
+header, and --- if the origin selected the verification key by the
+\emph{header} rather than by the signed field --- cause \(t_b\)-authored
+content to execute in \(t_a\)\textquotesingle s context or vice versa.
+This is exactly the confused-deputy instantiation of §II-D mode 2.
+Binding \(\mathsf{tid}_i\) (and \(\kappa\)) \emph{inside} the MAC input
+makes the identifier immutable under the unforgeability guarantee: any
+change to \(\mathsf{tid}\) changes \(m\), which invalidates \(\tau\)
+unless the attacker can forge --- contradicting Theorem 1. The binding
+is therefore not a convention but a proven property, which is the sense
+in which §II-D\textquotesingle s isolation obligation is
+\emph{discharged} rather than merely \emph{addressed}.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys}\label{citation-keys-2}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}RFC2104{]}} H. Krawczyk, M. Bellare, R. Canetti, "HMAC:
+  Keyed-Hashing for Message Authentication," RFC 2104, IETF, Feb. 1997.
+\item
+  \textbf{{[}FIPS198-1{]}} NIST, "The Keyed-Hash Message Authentication
+  Code (HMAC)," FIPS PUB 198-1, 2008.
+\item
+  \textbf{{[}BCK96{]}} M. Bellare, R. Canetti, H. Krawczyk, "Keying Hash
+  Functions for Message Authentication," CRYPTO 1996. (HMAC/NMAC PRF
+  security; see also M. Bellare, "New Proofs for NMAC and HMAC," CRYPTO
+  2006.)
+\item
+  \textbf{{[}BBT16{]}} M. Bellare, D. J. Bernstein, S. Tessaro,
+  "Hash-Function Based PRFs: AMAC and Its Multi-User Security,"
+  EUROCRYPT 2016. (Tight multi-user security of HMAC-style PRFs.)
+\item
+  \textbf{{[}Stripe-sig{]}} Stripe, "Verify webhook signatures,"
+  docs.stripe.com/webhooks/signature (accessed 2026-07-04).
+\end{itemize}
+
+\begin{quote}
+(BCK96/Bellare06), the tight multi-user HMAC bound (BBT16), and the
+Stripe timestamped scheme are primary-sourced (verified-facts Part 3;
+fetched from primaries, flagged for a final quote-level re-verification
+before submission). The tenant-binding and rotation theorems (IV-C/D)
+and the replay bound (IV-E) are original results; their proofs reduce
+solely to the standard EUF-CMA/PRF assumptions and assert no unverified
+external facts.
+\end{quote}
+
+\section{V. Lightweight NLP Heuristics for Webhook
+Screening}\label{v-lightweight-nlp-heuristics-for-webhook-screening}
+
+Having authenticated the webhook (§IV), the firewall screens its content
+for injection signatures before forwarding. This section defends the
+\emph{architectural} choice of a deterministic screening layer over an
+LLM-based guardrail at this position (§V-A), specifies the Aho--Corasick
+signature scanner (§V-B) and the linear feature passes (§V-C), gives
+input sanitization (§V-E), accounts the total per-request cost against
+the §III budget (§V-F), and states honestly the accuracy ceiling of
+heuristics relative to ML classifiers (§V-D).
+
+\subsection{V-A. Why Deterministic Screening at the Edge, Not an LLM
+Guardrail}\label{v-a-why-deterministic-screening-at-the-edge-not-an-llm-guardrail}
+
+A natural objection is: \emph{why not run an LLM guardrail (e.g., Llama
+Guard, a fine-tuned DeBERTa injection classifier) at the edge instead of
+hand-maintained signatures?} The answer is not that guardrails are less
+accurate --- for many inputs they are more accurate (§V-D) --- but that
+a model-based guardrail is \textbf{structurally incompatible with this
+architectural layer}, for four independent reasons rooted in §III.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Compute placement.} Transformer inference is not a
+  sub-millisecond, 128 MB-isolate workload. Llama Guard ($\approx$7--8 B
+  parameters) requires GPU-class accelerators and gigabytes of weights;
+  even a small encoder-only classifier (DeBERTa-base, $\approx$184 M params)
+  exceeds the isolate\textquotesingle s 128 MB memory ceiling (§III-B)
+  once weights, activations, and the runtime are counted, and its
+  matrix-multiply inference is orders of magnitude beyond a
+  \(\kappa N_{\max}\) linear scan. The edge isolate is the \emph{wrong
+  hardware} for tensor math.
+\item
+  \textbf{The guardrail becomes a network hop, not local compute.}
+  Deploying the model behind an inference API turns screening into a
+  \emph{subrequest} --- adding a full RTT (tens to hundreds of ms of
+  wall-clock, per the layered-detector measurements: model deep-scan
+  adds $\approx$300--800 ms {[}Layered{]}) to \emph{every} webhook, including
+  the benign majority. This inverts the design goal of §I-B: the cheap
+  perimeter check now costs more than the origin call it is meant to
+  gate. A deterministic scan keeps screening as \emph{local CPU}
+  (I/O-free), preserving the wall-clock SLO.
+\item
+  \textbf{Determinism and auditability.} A signature match is
+  explainable and reproducible: the threat log (§VI) records
+  \emph{which} signature fired. A model score is neither, complicating
+  the non-repudiation obligation (Table I, row 5) and incident
+  forensics.
+\item
+  \textbf{Attack surface.} An LLM guardrail is itself susceptible to
+  prompt injection --- the very threat it screens for
+  {[}arXiv-2601.07185 finds SFT defenses learn brittle surface
+  heuristics{]}. A finite-state automaton has no instruction-following
+  semantics to subvert.
+\end{enumerate}
+
+The correct architecture is therefore \textbf{layered}: a deterministic,
+high-precision, sub-millisecond scan at the edge (this section) that
+rejects known-signature attacks cheaply and, for the residual uncertain
+traffic, \emph{optionally} escalates to a model-based deep scan at the
+origin --- where GPU compute and higher latency budgets exist. This
+paper\textquotesingle s contribution is the edge layer; the escalation
+tier is discussed as future work (§IX). The edge layer\textquotesingle s
+role is not to be the last word on subtle semantic attacks but to
+eliminate the high-volume, signature-expressible ones within the CPU
+envelope, so that the expensive tiers see less traffic.
+
+\subsection{V-B. Layer 1: Aho--Corasick Multi-Signature
+Scan}\label{v-b-layer-1-ahocorasick-multi-signature-scan}
+
+\textbf{Problem.} Given a signature set \(S=\{s_1,\dots,s_p\}\)
+(injection phrases, jailbreak markers, control tokens; Appendix C),
+determine which \(s_j\) occur in the sanitized payload \(x\) of length
+\(n\).
+
+\textbf{Why not per-pattern matching.} Running a separate matcher per
+signature costs \(O\!\big(\sum_j (n+|s_j|)\big)=O(pn+m)\) where
+\(m=\sum_j|s_j|\) --- linear in the \emph{number} of signatures \(p\).
+With \(p\) in the hundreds to thousands, the \(pn\) term dominates and
+scales poorly. A single regular expression alternation
+\passthrough{\lstinline!(s\_1|...|s\_p)!} compiled to an NFA risks
+catastrophic backtracking on adversarial input (a ReDoS vector), which
+is itself a DoS surface (Table I, row 7).
+
+\textbf{Aho--Corasick.} The Aho--Corasick automaton is a trie of all
+signatures augmented with failure (suffix) links, forming a
+deterministic finite automaton that matches \textbf{all} signatures in a
+\textbf{single pass} over \(x\), regardless of \(p\) {[}Springer-AC{]}:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Construction:} \(O(m)\) time and space in the total signature
+  length \(m\) --- built \textbf{once at module top level} (§III-A) and
+  amortized to zero on the request path.
+\item
+  \textbf{Search:} \(O(n+z)\), where \(n=|x|\) and \(z\) is the number
+  of matches reported; each input byte triggers a constant number of
+  automaton transitions (goto/failure), with \textbf{no backtracking}.
+\end{itemize}
+
+Contrasted with KMP --- a \emph{single}-pattern algorithm at
+\(O(n+|s_j|)\) per pattern, hence \(O(pn+m)\) for \(p\) patterns ---
+Aho--Corasick removes the dependence on \(p\) from the search cost
+entirely {[}Springer-AC{]}. This is the property that makes hundreds of
+signatures affordable in one scan.
+
+\textbf{Match cap (bounding \(z\)).} Since \(z\le n\) in the worst case
+(e.g., many overlapping short signatures), we cap reported matches at a
+constant \(z_{\max}\) and early-exit on the first \emph{blocking}-class
+signature, so the effective per-request search cost is
+\(O(n+\min(z,z_{\max}))=
+O(n)\). Early exit is safe for a \emph{reject} decision (one confirmed
+malicious signature suffices) and the cap only limits \emph{enumeration}
+for logging, not detection.
+
+\subsection{V-C. Layer 2: Linear Structural and Entropy
+Features}\label{v-c-layer-2-linear-structural-and-entropy-features}
+
+Signatures catch \emph{known} phrasings; a small set of \(O(n)\)
+structural features catches \emph{structural} injection independent of
+exact wording. Each is a single linear pass, contributing to the
+constant \(k\le 4\) of §III-C:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Delimiter/role-token density.} Count occurrences of
+  instruction-boundary and role markers
+  (\passthrough{\lstinline!\#\#\# instruction!},
+  \passthrough{\lstinline!<|system|>!},
+  \passthrough{\lstinline!assistant:!}, fenced-block openers) normalized
+  by length; a spike signals delimiter-spoofing / tag-injection.
+  \(O(n)\), computed as a by-product of the Aho--Corasick pass over a
+  token sub-dictionary.
+\item
+  \textbf{Imperative-override heuristic.} Presence of override
+  collocations ("ignore/disregard \ldots{} previous/above \ldots{}
+  instructions/prompt") captured as multi-word signatures in Layer 1;
+  scored as a weighted feature rather than an immediate block to limit
+  false positives on benign text that quotes such phrases.
+\item
+  \textbf{Shannon entropy.}
+  \(\hat{H}(x)=-\sum_{c} \hat p(c)\log_2 \hat p(c)\) over the
+  byte/character distribution, one pass to accumulate counts, \(O(n)\).
+  Anomalously high entropy flags encoded or obfuscated payloads
+  (base64/hex smuggling) that evade literal signatures; anomalously low
+  entropy with high delimiter density flags templated injection. Entropy
+  is a \emph{weak} feature used only to \emph{escalate} (route to the
+  origin deep-scan tier), never to block alone (§V-D).
+\end{itemize}
+
+The layer emits a score vector; a linear threshold rule combines Layer 1
+blocking hits (hard reject), weighted Layer 1/2 features (soft score),
+and an escalate/forward/reject decision. All features are \(O(n)\) and
+share the input scan, so Layer 2 adds a small constant multiple of
+\(n\), not a new asymptotic term.
+
+\subsection{V-D. Accuracy Ceiling: Heuristics vs. ML Classifiers (Honest
+Positioning)}\label{v-d-accuracy-ceiling-heuristics-vs-ml-classifiers-honest-positioning}
+
+We do \textbf{not} claim deterministic heuristics match ML classifiers
+on subtle or novel injections. The evidence base is explicit about the
+ceiling, and we report it rather than obscure it:
+
+\begin{itemize}
+\tightlist
+\item
+  Lexical/deterministic filters achieve moderate standalone
+  discrimination --- reported ROC-AUC in the $\approx$0.65 band for
+  Aho--Corasick / regex-denylist style detectors on injection corpora
+  {[}arXiv-2601.07185{]} \emph{(from source; to be re-verified at claim
+  level, see caveat)}.
+\item
+  Embedding-based ML classifiers can do better: a Random Forest over
+  \passthrough{\lstinline!text-embedding-3-small!} features reached AUC
+  0.764 / P 0.867 / R 0.870, outperforming encoder-only baselines
+  (DeBERTa variants at AUC $\approx$0.50--0.59) {[}arXiv-2410.22284{]} ---
+  though this rests on a single preprint with an author-curated set and
+  modest absolute AUC (medium confidence, verified-facts Part 2).
+\item
+  Fine-tuned guardrails achieve high attack-rejection but can learn
+  brittle surface correlations with large OOD degradation
+  {[}arXiv-2601.07185{]} (medium confidence, single source).
+\end{itemize}
+
+The design implication is precisely the layering of §V-A: the edge
+heuristics are positioned as a \textbf{high-precision first filter}
+(favoring low false-positive rate at a chosen operating point, so benign
+traffic is not wrongly blocked) that cheaply removes
+signature-expressible attacks, with the \emph{recall gap} on
+novel/semantic attacks delegated to an optional origin-side model tier.
+§VII measures the edge layer\textquotesingle s own FPR/FNR at its
+operating point; we make no claim that the edge layer alone achieves the
+full-system detection rate, only that it does so for the
+signature-expressible class it targets, within the CPU budget.
+
+\subsection{V-E. Input Sanitization and
+Canonicalization}\label{v-e-input-sanitization-and-canonicalization}
+
+Signatures match a \emph{canonical} representation; an attacker who can
+vary encoding while preserving meaning evades a naive scan. Before Layer
+1, the firewall (Fig. 1, step 3) applies, in one or two linear passes:
+(a) \textbf{Unicode normalization} (NFKC) to fold
+compatibility/homoglyph variants; (b) \textbf{decoding of transport
+encodings} actually in scope (percent-encoding, HTML entities) where the
+downstream will decode them, to prevent encode-smuggling past the
+scanner; (c) \textbf{whitespace and zero-width-character collapse}
+(zero-width joiners/spaces are a known signature-splitting trick); and
+(d) \textbf{case folding} for case-insensitive signatures. Sanitization
+is bounded by \(O(n)\) and its output length is \(\le c\cdot n\) for a
+small constant, preserving the \(N_{\max}\) bound. Crucially,
+sanitization is applied to the copy that is \emph{scanned}; the
+\emph{forwarded} payload is the original (the signature over which was
+already verified in §IV), so normalization cannot alter authenticated
+content --- it only informs the block/forward decision.
+
+\subsection{V-F. Per-Request Cost Accounting Against the §III
+Budget}\label{v-f-per-request-cost-accounting-against-the-iii-budget}
+
+Collecting the layers, the per-request CPU cost is
+\fiteq{C_{\text{req}} \le \underbrace{c_{\text{san}}n}_{\text{§V-E}} +
+\underbrace{c_{\text{ac}}(n+z_{\max})}_{\text{§V-B, capped}} +
+\underbrace{k\,c_{\text{lin}}n}_{\text{§V-C},\ k\le4} +
+\underbrace{c_{\text{hmac}}n}_{\text{§IV}} = \kappa\,n \le \kappa N_{\max},}
+exactly the form of §III-C: a constant \(\kappa\) times a bounded input,
+with the one-time \(O(m)\) automaton construction excluded (module
+scope). There is no super-linear term, no backtracking, and no
+per-request allocation proportional to \(p\) (the signature count lives
+in the shared, once-built automaton counted against the 128 MB isolate
+memory, not per request). The absolute sub-millisecond claim is thus
+reduced to a single measured quantity \(\kappa/\rho\) (§III-C),
+evaluated at \(N_{\max}=128\) KiB against the 10 ms Free-plan ceiling in
+§VII. The structural guarantee --- bounded, strictly linear,
+backtrack-free, construction-amortized --- holds regardless of the
+measured constant, which is the claim §III promised this section would
+substantiate.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys}\label{citation-keys-3}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}Springer-AC{]}} "\emph{(Aho--Corasick multi-pattern
+  matching for signature detection)}," Springer,
+  doi:10.1007/978-3-031-96093-2\_15.
+\item
+  \textbf{{[}arXiv-2601.07185{]}} "Defenses Against Prompt Attacks Learn
+  Surface Heuristics," arXiv:2601.07185.
+\item
+  \textbf{{[}arXiv-2410.22284{]}} Ayub \& Majumdar,
+  "\emph{(embedding-based prompt-injection classification)}," CAMLIS
+  2024, arXiv:2410.22284.
+\item
+  \textbf{{[}Layered{]}} "\emph{(layered prompt-injection detector;
+  \textless1 ms Layers 1--2, 300--800 ms model layer)}," dev.to
+  (secondary; used only for the model-tier latency order-of-magnitude).
+\end{itemize}
+
+\begin{quote}
+heuristic-vs-ML figures (V-D) are MEDIUM confidence / single-source and
+are presented as such, with the lexical-filter AUC flagged for
+claim-level re-verification. V-A\textquotesingle s LLM-guardrail
+incompatibility argument rests on the CONFIRMED §III envelope (128 MB,
+sub-ms CPU) plus the model-tier latency order-of-magnitude from
+{[}Layered{]} (secondary --- used only qualitatively).
+\end{quote}
+
+\section{VI. Asynchronous Threat Logging and Data
+Architecture}\label{vi-asynchronous-threat-logging-and-data-architecture}
+
+Every interception decision (Fig. 1) must be recorded to a durable,
+queryable, immutable audit trail --- for forensics, for detection
+tuning, and for compliance (§VI-F) --- yet the recording must never
+appear on the request\textquotesingle s critical path. This section
+resolves that tension: §VI-A states the requirements, §VI-B gives the
+decoupled write path via \passthrough{\lstinline!waitUntil!} plus a
+durable queue, §VI-C--E justify PostgreSQL JSONB with TOAST, WAL/GIN
+tuning, and date partitioning for high-velocity ingestion at scale, and
+§VI-F maps the design to PCI-DSS and SOC 2 while enforcing data
+minimization.
+
+\subsection{VI-A. Requirements}\label{vi-a-requirements}
+
+The threat log must satisfy five properties simultaneously: \textbf{(R1)
+non-blocking} --- logging adds zero wall-clock latency to the webhook
+response; \textbf{(R2) durable} --- an accepted event is not lost under
+isolate eviction or transient DB unavailability; \textbf{(R3)
+high-velocity} --- ingestion sustains attack bursts (a flood produces
+one log row per rejected request) without back-pressuring the edge;
+\textbf{(R4) queryable} --- heterogeneous, schema-varying attack
+payloads remain indexable for analysis; and \textbf{(R5) immutable and
+compliant} --- the record is append-only and admissible as an audit
+trail without itself becoming a data-exposure liability. R1 and R2 are
+in tension (durability usually implies waiting); §VI-B resolves it by
+moving durability off the request path into a queue.
+
+\subsection{\texorpdfstring{VI-B. Decoupled Execution:
+\texttt{waitUntil} + Durable
+Queue}{VI-B. Decoupled Execution: waitUntil + Durable Queue}}\label{vi-b-decoupled-execution-waituntil--durable-queue}
+
+\textbf{\passthrough{\lstinline!waitUntil!} mechanics.} The Workers
+runtime exposes \passthrough{\lstinline!ctx.waitUntil(promise)!} (the
+successor to \passthrough{\lstinline!FetchEvent.waitUntil!}), which
+registers a promise whose completion the runtime awaits \emph{after the
+\passthrough{\lstinline!Response!} has already been returned to the
+client}. Concretely, the handler computes the block/forward decision
+(Fig. 1, steps 1--6), returns the response (step forward/reject), and
+calls \passthrough{\lstinline!ctx.waitUntil(logThreat(event))!}; the
+isolate is kept alive to drain \passthrough{\lstinline!logThreat!} but
+the client\textquotesingle s latency is bounded by the response, not by
+the log write. Because the log write is network I/O, it \textbf{does not
+consume the CPU budget} (§III-B) --- R1 is met by construction, and the
+sub-millisecond CPU analysis of §V-F is unaffected by logging.
+
+\textbf{Why \passthrough{\lstinline!waitUntil!} alone is insufficient
+for R2.} \passthrough{\lstinline!waitUntil!} is \emph{best-effort}: if
+the isolate is evicted or the write fails, the event is lost, and it
+offers no back-pressure or batching. Writing directly to PostgreSQL from
+the edge also couples every request to a database connection ---
+untenable at edge concurrency and a head-of-line risk if the DB slows.
+We therefore interpose a \textbf{durable queue} (Cloudflare Queues, or a
+Durable Object buffer): \passthrough{\lstinline!waitUntil!} performs a
+single fast \passthrough{\lstinline!queue.send(event)!} (one
+subrequest), and a separate \textbf{queue consumer} Worker batches
+events and performs the PostgreSQL insert. This yields:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{R1/R2 both:} the edge pays only a queue enqueue (fast,
+  durable-once-acked); durability and retry live in the consumer, off
+  the request path.
+\item
+  \textbf{Batching for R3:} the consumer inserts in batches (multi-row
+  \passthrough{\lstinline!INSERT!} / \passthrough{\lstinline!COPY!}),
+  amortizing per-row WAL and round-trip cost --- the single most
+  effective throughput lever (§VI-D).
+\item
+  \textbf{Back-pressure isolation:} a DB slowdown grows the queue, not
+  the webhook latency; the edge never blocks. The queue depth is itself
+  a monitorable DoS signal.
+\end{itemize}
+
+Delivery is at-least-once (consumer retries on failure), so the schema
+uses an idempotency key (the authenticated nonce \(\eta\) from §IV, or a
+synthetic event id) with
+\passthrough{\lstinline!INSERT ... ON CONFLICT DO NOTHING!} to dedupe
+replays of the log write.
+
+\subsection{VI-C. JSONB for Unstructured, High-Velocity Attack
+Payloads}\label{vi-c-jsonb-for-unstructured-high-velocity-attack-payloads}
+
+Attack payloads are heterogeneous: different injection classes carry
+different fields, and the raw webhook body has no fixed schema across
+tenants. A rigid relational schema would require migration per new
+attack shape; a text blob is not queryable (R4). PostgreSQL
+\passthrough{\lstinline!jsonb!} resolves this:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Binary, decomposed storage.} Per the official documentation,
+  \passthrough{\lstinline!json!} stores an exact text copy that
+  "processing functions must reparse on each execution," whereas
+  \passthrough{\lstinline!jsonb!} is stored "in a decomposed binary
+  format that makes it slightly slower to input due to added conversion
+  overhead, but significantly faster to process, since no reparsing is
+  needed" {[}PG-json{]}. For a write-once/read-many audit log queried
+  during investigations, the one-time input cost is worth the repeated
+  query speedup, and --- decisively for R4 ---
+  \textbf{\passthrough{\lstinline!jsonb!} supports indexing} (GIN,
+  §VI-D) whereas \passthrough{\lstinline!json!} does not.
+\item
+  \textbf{TOAST for oversized payloads.} A large injection payload
+  (e.g., a multi-kilobyte obfuscated prompt) would otherwise threaten
+  the 8 KB heap page. TOAST --- "The Oversized-Attribute Storage
+  Technique" --- triggers automatically "only when a row value to be
+  stored in a table is wider than
+  \passthrough{\lstinline!TOAST\_TUPLE\_THRESHOLD!} bytes (normally 2
+  kB)," compressing and/or moving field values out-of-line "until the
+  row value is shorter than
+  \passthrough{\lstinline!TOAST\_TUPLE\_TARGET!} bytes (also normally 2
+  kB)" {[}PG-toast{]}. The \passthrough{\lstinline!jsonb!} column uses
+  the default \passthrough{\lstinline!EXTENDED!} strategy (compression
+  then out-of-line) {[}PG-toast{]}, so wide payloads are transparently
+  compressed and relocated to the TOAST relation, keeping the main-heap
+  tuples narrow and the table scannable. This is why unstructured,
+  occasionally-large payloads do \textbf{not} bloat the primary heap:
+  oversized values live out-of-line by construction. \emph{(Precision
+  note: "2 kB" is the documented nominal threshold; we state it as $\approx$2
+  kB, not an exact 2048, per the docs\textquotesingle{} "normally 2 kB"
+  wording.)}
+\end{itemize}
+
+\subsection{VI-D. WAL, Insert Throughput, and Avoiding GIN Index
+Bloat}\label{vi-d-wal-insert-throughput-and-avoiding-gin-index-bloat}
+
+\textbf{WAL and the durability/throughput trade.} Every insert is first
+written to the Write-Ahead Log for durability. Two knobs govern the
+cost, both documentation-confirmed:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{\passthrough{\lstinline!synchronous\_commit!}.} Default
+  \passthrough{\lstinline!on!} makes each commit wait for WAL flush to
+  disk. Setting it \passthrough{\lstinline!off!} removes the wait; per
+  the docs this risks losing recent committed transactions (maximum
+  delay three times \passthrough{\lstinline!wal\_writer\_delay!}) but
+  "does not create any risk of database inconsistency"
+  {[}PG-wal-conf{]}. For a \emph{threat log}, this trade is appropriate:
+  losing the last few hundred milliseconds of log rows under a crash is
+  acceptable (the queue\textquotesingle s at-least-once retry recovers
+  most), and there is no cross-row invariant to violate. We set
+  \passthrough{\lstinline!synchronous\_commit = off!} for the log
+  database (not for any transactional tenant data).
+\item
+  \textbf{Group commit.} \passthrough{\lstinline!commit\_delay!}
+  (default 0) "adds a time delay before a WAL flush \ldots{} allowing a
+  larger number of transactions to commit via a single WAL flush,"
+  active when at least \passthrough{\lstinline!commit\_siblings!}
+  (default 5) transactions are concurrent {[}PG-wal-conf{]}. With
+  batched inserts from the consumer this further amortizes flush cost.
+\item
+  \textbf{Checkpoints.} Checkpoints occur every
+  \passthrough{\lstinline!checkpoint\_timeout!} (default 5 min) or when
+  \passthrough{\lstinline!max\_wal\_size!} (default 1 GB) is about to be
+  exceeded {[}PG-wal-config{]}. Under sustained insert load we raise
+  \passthrough{\lstinline!max\_wal\_size!} and keep
+  \passthrough{\lstinline!checkpoint\_completion\_target!} at its
+  default 0.9 (the recommended maximum) to spread checkpoint I/O and
+  avoid write stalls {[}PG-wal-config{]}. With
+  \passthrough{\lstinline!full\_page\_writes!} on (torn-page
+  protection), frequent checkpoints inflate WAL volume, so fewer,
+  wider-spaced checkpoints favor insert throughput.
+\end{itemize}
+
+\textbf{The GIN index-bloat problem and its mitigation.} To keep
+payloads queryable (R4) we index the \passthrough{\lstinline!jsonb!}
+column with GIN. But GIN updates are "inherently slow \ldots{} inserting
+or updating one heap row can cause many inserts into the index (one for
+each key extracted from the indexed item)" {[}PG-gin{]} --- exactly the
+pathology that would throttle high-velocity ingestion.
+PostgreSQL\textquotesingle s \passthrough{\lstinline!fastupdate!}
+mechanism defers this: new entries go "into a temporary, unsorted list
+of pending entries," flushed to the main GIN structure on
+vacuum/autoanalyze, on
+\passthrough{\lstinline!gin\_clean\_pending\_list()!}, or when the list
+exceeds \passthrough{\lstinline!gin\_pending\_list\_limit!}
+{[}PG-gin{]}. We therefore (i) enable
+\passthrough{\lstinline!fastupdate!} and size
+\passthrough{\lstinline!gin\_pending\_list\_limit!} so pending-list
+flushes coincide with batch boundaries, turning per-row index
+maintenance into periodic bulk maintenance; and (ii) index only the
+\passthrough{\lstinline!jsonb!} sub-paths actually queried (e.g., a
+\passthrough{\lstinline!jsonb\_path\_ops!} GIN on the signature/verdict
+keys) rather than the whole document, reducing extracted-key fan-out.
+\emph{(The \passthrough{\lstinline!jsonb\_path\_ops!} vs
+\passthrough{\lstinline!jsonb\_ops!} operator-class trade is in scope
+but was not primary-verified; see evidence status.)}
+
+\subsection{VI-E. Native Declarative Partitioning for Scale and
+Retention}\label{vi-e-native-declarative-partitioning-for-scale-and-retention}
+
+A monotonically growing log table degrades: index size grows, autovacuum
+lengthens, and time-window queries scan irrelevant history.
+PostgreSQL\textquotesingle s \textbf{native declarative partitioning}
+(built in since PG 10, distinct from and more performant than legacy
+inheritance/\passthrough{\lstinline!UNION ALL!} {[}PG-partition{]})
+addresses all three. We declare
+\passthrough{\lstinline!PARTITION BY RANGE (created\_at)!} with one
+partition per day (or week), bounds "inclusive at the lower end and
+exclusive at the upper end" {[}PG-partition{]}:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Ingestion locality.} Inserts route automatically to the
+  current partition {[}PG-partition{]}; its indexes stay small and
+  cache-resident, so index maintenance cost is bounded by
+  \emph{today\textquotesingle s} volume, not all history --- directly
+  countering the bloat of §VI-D at the table level.
+\item
+  \textbf{Query pruning.} Investigations are time-scoped ("attacks in
+  the last 24 h"); partition pruning restricts the scan to the relevant
+  partitions.
+\item
+  \textbf{O(1) retention.} Aging out old logs uses
+  \passthrough{\lstinline!DETACH PARTITION!}/\passthrough{\lstinline!DROP TABLE!},
+  which the docs note is "far faster than a bulk operation" and
+  "entirely avoid{[}s{]} the VACUUM overhead caused by a bulk DELETE"
+  {[}PG-partition{]}. Retention rollover (§VI-F) becomes a metadata
+  operation, not a billion-row delete.
+\item
+  \textbf{Constraint.} Any primary/unique key on a partitioned table
+  "must include all of the partition key columns" {[}PG-partition{]};
+  our idempotency key is therefore
+  \passthrough{\lstinline!(created\_at, event\_id)!}, which both
+  satisfies the constraint and aligns dedup with the partition.
+\end{itemize}
+
+\subsection{VI-F. Compliance Guardrails: PCI-DSS, SOC 2, and Data
+Minimization}\label{vi-f-compliance-guardrails-pci-dss-soc-2-and-data-minimization}
+
+An immutable attack-log serves compliance, but a naïvely-implemented one
+\emph{becomes} a breach: an attack payload aimed at a payment gateway
+may itself contain a Primary Account Number (PAN) or PII. The design
+must satisfy the audit-trail mandate \textbf{and} the data-minimization
+mandate at once.
+
+\textbf{Audit-trail mapping.} PCI-DSS v4.0.1 \textbf{Requirement 10}
+("Log and monitor all access to system components and cardholder data")
+governs the audit trail; sub-requirement \textbf{10.5.1} mandates
+retaining audit-log history for \textbf{at least 12 months}, with the
+\textbf{most recent 3 months immediately available} for analysis ("hot"
+storage) {[}PCI-DSS{]}. SOC 2 maps to the AICPA Trust Services Criteria
+Common Criteria family \textbf{CC7}: \textbf{CC7.2} (monitor system
+components to detect anomalies and security events) and \textbf{CC7.3}
+(evaluate security events and trigger incident response), CC7.1
+(vulnerability detection), and CC7.4 (incident response)
+{[}AICPA-TSC{]}. An immutable, asynchronously-written PostgreSQL audit
+trail supplies exactly the \emph{detection and record} evidence these
+criteria require; unlike PCI-DSS, SOC 2 fixes no statutory retention
+period (it is auditor/period-defined). \textbf{Immutability} is enforced
+architecturally, satisfying PCI-DSS \textbf{10.3.2} (audit logs
+protected from modification) and \textbf{10.3.1} (read access limited to
+a job-related need): the log role has \passthrough{\lstinline!INSERT!}
+and \passthrough{\lstinline!SELECT!} privileges only --- no
+\passthrough{\lstinline!UPDATE!}/\passthrough{\lstinline!DELETE!} --- so
+records are append-only; the \emph{sole} deletion path is time-based
+partition \passthrough{\lstinline!DROP!} (§VI-E), executed by a separate
+retention role on a fixed schedule, which is precisely the controlled,
+policy-driven expiry the retention clause expects rather than ad hoc row
+deletion. What to log is governed by \textbf{10.2} (logs sufficient to
+support anomaly detection and forensics); the firewall records every
+interception decision to that end.
+
+\textbf{Data minimization (the critical guardrail).} We never persist
+raw sensitive data. Before the edge enqueues an event (§VI-B), a bounded
+redaction pass (an extension of the §V-E sanitization, \(O(n)\)) masks
+high-confidence sensitive tokens: PAN candidates (Luhn-valid digit runs)
+are replaced by a truncated token (first-6/last-4 with the middle masked
+--- exactly the maximum display exposure PCI-DSS \textbf{3.4.1} permits,
+BIN + last four --- or a keyed hash rendering the value unreadable per
+\textbf{3.5.1}, which lists one-way hashing, truncation, index tokens,
+or strong cryptography), and recognizable PII patterns are masked.
+Sensitive authentication data (full track, CVV, PIN) is never retained
+at all, per \textbf{3.3}. What the log stores is therefore the
+\textbf{attack metadata} --- which signatures fired (§V-B), the feature
+scores (§V-C), the verdict, tenant id, timestamps --- and a
+\textbf{redacted} payload sufficient for forensic pattern analysis but
+stripped of cardholder data. This reconciles "log the attack" with
+"store no CHD": the forensic value of an injection payload lies in its
+\emph{instruction structure}, which survives redaction, not in any
+incidental PAN it carries, which does not need to. Redaction at the
+\emph{edge} (before the queue) ensures raw CHD never even reaches the
+logging tier, minimizing the systems in PCI scope.
+
+\begin{quote}
+\textbf{Evidence status for §VI-F:} the control references --- PCI-DSS
+v4.0.1 \textbf{10.5.1} ("Retain audit log history for at least 12
+months, with at least the most recent three months immediately available
+for analysis," verbatim standard text), \textbf{10.3.1/10.3.2} (log
+protection), \textbf{10.2} (logging scope), \textbf{3.3} (no SAD after
+authorization), \textbf{3.4.1} (PAN display max BIN + last 4),
+\textbf{3.5.1} (stored PAN rendered unreadable); and AICPA TSC
+\textbf{CC7.1--CC7.4} --- are all CONFIRMED against the primary PCI SSC
+v4.0.1 standard and the AICPA 2017 TSC (2022 revised) in a dedicated
+verification pass. §VI-F is now on the same primary-sourced footing as
+the rest of §VI.
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys (PostgreSQL claims: all CONFIRMED 3-0,
+verified-facts Part
+4)}\label{citation-keys-postgresql-claims-all-confirmed-3-0-verified-facts-part-4}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}PG-json{]}} PostgreSQL Global Dev. Group, "JSON Types,"
+  postgresql.org/docs/current/datatype-json.html.
+\item
+  \textbf{{[}PG-toast{]}} "Database Physical Storage --- TOAST,"
+  postgresql.org/docs/current/storage-toast.html.
+\item
+  \textbf{{[}PG-wal-conf{]}} "Write Ahead Log --- runtime config,"
+  postgresql.org/docs/current/runtime-config-wal.html.
+\item
+  \textbf{{[}PG-wal-config{]}} "WAL Configuration,"
+  postgresql.org/docs/current/wal-configuration.html.
+\item
+  \textbf{{[}PG-gin{]}} "GIN Indexes,"
+  postgresql.org/docs/current/gin.html.
+\item
+  \textbf{{[}PG-partition{]}} "Table Partitioning,"
+  postgresql.org/docs/current/ddl-partitioning.html.
+\item
+  \textbf{{[}PCI-DSS{]}} PCI Security Standards Council, "Payment Card
+  Industry Data Security Standard v4.0.1," June 2024. Req 10.2
+  (logging), 10.3.1/10.3.2 (log protection), 10.5.1 (12-month retention
+  / 3-month hot); Req 3.3 (no SAD), 3.4.1 (PAN display masking), 3.5.1
+  (PAN rendered unreadable).
+\item
+  \textbf{{[}AICPA-TSC{]}} AICPA, "Trust Services Criteria for Security,
+  Availability, Processing Integrity, Confidentiality, and Privacy"
+  (2017, rev. 2022), Common Criteria CC7.1--CC7.4.
+\end{itemize}
+
+\begin{quote}
+\passthrough{\lstinline!synchronous\_commit!}/\passthrough{\lstinline!commit\_delay!}/checkpoint/\passthrough{\lstinline!full\_page\_writes!}
+behavior, GIN \passthrough{\lstinline!fastupdate!}/
+\passthrough{\lstinline!gin\_pending\_list\_limit!}, and native RANGE
+partitioning with DETACH/DROP retention --- are all CONFIRMED at high
+confidence (verified-facts Part 4, 25/25 claims 3-0, official docs).
+\passthrough{\lstinline!waitUntil!} semantics (§VI-B) follow the Workers
+execution model of §III (CONFIRMED). §VI-F compliance clauses (PCI Req
+10.2/10.3.1/10.3.2/10.5.1, 3.3/3.4.1/3.5.1; SOC 2 CC7.1--CC7.4) are
+CONFIRMED against the primary PCI SSC v4.0.1 standard and AICPA 2017
+TSC. The \passthrough{\lstinline!jsonb\_path\_ops!} choice (§VI-D) is
+noted as not-yet-verified.
+\end{quote}
+
+\section{VII. Empirical Evaluation}\label{vii-empirical-evaluation}
+
+This section defines the evaluation of two claims the architecture must
+support: \textbf{latency} --- the edge firewall adds bounded, sub-SLO
+latency at the tail (§VII-B analytical, §VII-C protocol) --- and
+\textbf{detection efficacy} --- the edge layer mitigates the
+signature-expressible attack class at high rate with a controlled
+false-positive rate (§VII-D). We first fix the methodology and corpus
+(§VII-A), then give the analytical latency model, the measurement
+protocols, the statistical treatment (§VII-E), and threats to validity
+(§VII-F).
+
+\begin{quote}
+\textbf{Reporting convention.} This paper specifies the experiment and
+does \textbf{not} assert result values it has not measured.
+\textbf{Detection-efficacy results (§VII-D) are populated from a real
+run} over the 662-row deepset corpus via the Phase-2 harness;
+\textbf{latency percentiles (§VII-C) remain placeholders}
+\(\langle\cdot\rangle\) pending a full edge deployment. Analytical
+bounds (§VII-B) are derived and labelled as such, distinct from
+empirical percentiles. Where a run overturned an initial expectation ---
+as the detection numbers do for the "\(>99\%\)" ambition --- we report
+the measurement and revise the claim, not the reverse.
+\end{quote}
+
+\subsection{VII-A. Methodology and Benchmark
+Corpus}\label{vii-a-methodology-and-benchmark-corpus}
+
+\textbf{Testbed.} The firewall Worker is deployed to the edge runtime
+(Cloudflare Workers) with a mock origin that returns a fixed-size
+response after a controlled service time \(S_O\), isolating the
+firewall\textquotesingle s \emph{added} latency from origin variability.
+Load is generated with \textbf{k6} (distributed, scriptable, native
+percentile output) cross-checked against \textbf{autocannon} for a
+second measurement path. Each configuration is run for \(R\) repetitions
+after a warm-up that guarantees a warm isolate (§III-A), so cold-start
+is measured separately (§VII-C) rather than contaminating the
+steady-state distribution.
+
+\textbf{Benchmark corpus (documented provenance).} Rather than the
+folklore "200-payload set" --- which corresponds to no real dataset ---
+we use a corpus of \emph{verified provenance}:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Primary:} \passthrough{\lstinline!deepset/prompt-injections!}
+  (Hugging Face) --- \textbf{662 examples} (546 train / 116 test),
+  binary labels \textbf{0 = legitimate, 1 = injection}, columns
+  \passthrough{\lstinline!text!}/\passthrough{\lstinline!label!},
+  German+English, Apache 2.0 {[}DS-PI{]}. The \textbf{malicious payload
+  set} \(\mathcal{X}^{+}\) is the \passthrough{\lstinline!label==1!}
+  subset; the \textbf{benign control set} \(\mathcal{X}^{-}\) (for
+  false-positive measurement) is the \passthrough{\lstinline!label==0!}
+  subset.
+\item
+  \textbf{Diversity supplement:}
+  \passthrough{\lstinline!jackhhao/jailbreak-classification!} (1,306
+  rows,
+  \passthrough{\lstinline!jailbreak!}/\passthrough{\lstinline!benign!},
+  Apache 2.0 {[}DS-JB{]}) and
+  \passthrough{\lstinline!Lakera/gandalf\_ignore\_instructions!}
+  {[}DS-GA{]}, to test recall on jailbreak and instruction-ignore
+  families beyond the primary set.
+\end{itemize}
+
+The exact counts \(|\mathcal{X}^{+}|, |\mathcal{X}^{-}|\) used in each
+experiment are reported \textbf{from the data at run time} (a
+seed-fixed, documented split), not assumed; the harness prints them for
+inclusion in the results table. This makes the corpus reproducible from
+named, licensed sources --- directly remedying the unsupported dataset
+provenance the design review flagged.
+
+\subsection{VII-B. Analytical Latency Model (the theoretical
+bound)}\label{vii-b-analytical-latency-model-the-theoretical-bound}
+
+We decompose the firewall\textquotesingle s \emph{added} end-to-end
+latency (excluding origin service time \(S_O\), which the firewall does
+not control) into its constituent terms, per the Fig. 1 pipeline:
+\fiteq{L_{\text{added}} \;=\; \underbrace{L_{\text{CPU}}^{\text{proc}}}_{\text{steps 1--6, local}}
+\;+\; \underbrace{L_{\text{enq}}}_{\text{waitUntil enqueue, off-path}}
+\;+\; \underbrace{L_{\text{net}}^{\Delta}}_{\text{proxy hop overhead}}.}
+
+\textbf{The CPU term.} From §III-C/§V-F, the local processing cost is
+\(C_{\text{req}}\le\kappa N_{\max}\) operations, i.e. wall-time
+\(L_{\text{CPU}}^{\text{proc}} = C_{\text{req}}/\rho \le
+(\kappa/\rho)\,N_{\max}\). This is the term the theory bounds;
+\(\kappa/\rho\) (per-byte wall cost) is the single empirical constant,
+measured in §VII-C. Structurally it is \(O(N_{\max})\) with no
+super-linear component, so it cannot exhibit a heavy tail from the
+algorithm itself.
+
+\textbf{The off-path term.} \(L_{\text{enq}}\) is the
+\passthrough{\lstinline!queue.send!} enqueue (§VI-B). Because the
+threat-log write is deferred via \passthrough{\lstinline!waitUntil!}
+\emph{after} the response returns, \(L_{\text{enq}}\) contributes to the
+\emph{response} path only as a single fast subrequest and the DB write
+contributes \textbf{zero} (it happens after the client is served). We
+include \(L_{\text{enq}}\) conservatively; if the enqueue itself is also
+deferred behind the response, this term vanishes from
+\(L_{\text{added}}\).
+
+\textbf{The proxy-hop term.} \(L_{\text{net}}^{\Delta}\) is the
+incremental network cost of interposing the edge proxy versus a direct
+origin call. Since the edge runtime terminates the connection at a
+point-of-presence geographically near the client,
+\(L_{\text{net}}^{\Delta}\) is typically \emph{small or negative} (edge
+TLS termination can reduce client-perceived latency), but we treat it as
+a non-negative unknown bounded by measurement.
+
+\textbf{Tail (p99) argument.} The p99 of \(L_{\text{added}}\) is bounded
+by the p99 of each additive term (subadditivity of quantiles does not
+hold in general, so we bound conservatively by the sum of per-term p99s
+under independence, and validate empirically):
+\fiteq{L_{\text{added}}^{p99} \;\lesssim\; \frac{\kappa}{\rho}N_{\max}
+\;+\; L_{\text{enq}}^{p99} \;+\; L_{\text{net}}^{\Delta,p99}.} The
+\textbf{claim to be tested} is
+\(L_{\text{added}}^{p99} < 50\text{ ms}\). The analysis shows the
+\emph{algorithmic} term is a bounded constant (sub-millisecond for
+realistic \(\kappa/\rho\) and \(N_{\max}=128\) KiB, since even \(\rho\)
+on the order of \(10^{8}\) byte-ops/s gives
+\(\frac{\kappa}{\rho}N_{\max}\ll 1\) ms), so any violation of the 50 ms
+target must originate in the \emph{network/queue} terms, not the
+firewall\textquotesingle s computation --- which is the
+decomposition\textquotesingle s diagnostic value. §VII-C tests the bound
+and attributes any tail to the correct term.
+
+\subsection{VII-C. Empirical Latency
+Protocol}\label{vii-c-empirical-latency-protocol}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Percentiles.} Report
+  \(\langle p50\rangle, \langle p90\rangle, \langle p99\rangle\) (and
+  \(\langle p99.9\rangle\)) of \(L_{\text{added}}\), computed from
+  \(\ge N_{\text{req}}\) requests per configuration with the origin
+  mock\textquotesingle s \(S_O\) subtracted. Percentiles are estimated
+  with the harness\textquotesingle s streaming estimator and
+  cross-checked by a bootstrap over raw samples (§VII-E).
+\item
+  \textbf{Isolating \(\kappa/\rho\).} Sweep payload size
+  \(N\in\{1\text{ KiB},\dots,N_{\max}\}\) and regress
+  \(L_{\text{CPU}}^{\text{proc}}\) on \(N\); the slope is
+  \(\kappa/\rho\) (closing the §III-C/§V-F loop with a measured
+  constant), the intercept is fixed overhead. Report
+  \(\langle\kappa/\rho\rangle\) with a confidence band.
+\item
+  \textbf{Cold vs warm.} Report cold-start added latency
+  \(\langle L_{\text{cold}}\rangle\) separately (first request to a
+  fresh isolate, including module-scope automaton build, §III-A) from
+  warm steady state, since they have different distributions and the
+  automaton build is a one-time cost.
+\item
+  \textbf{Load levels.} Repeat at increasing arrival rates to the
+  saturation point; report the rate at which \(L_{\text{added}}^{p99}\)
+  crosses the SLO, characterizing headroom.
+\end{itemize}
+
+\subsection{VII-D. Detection-Efficacy
+Methodology}\label{vii-d-detection-efficacy-methodology}
+
+\textbf{Confusion matrix.} Running
+\(\mathcal{X}^{+}\cup\mathcal{X}^{-}\) through the firewall at a fixed
+decision threshold \(\theta\) (§V-C) yields counts \(TP, FP, TN, FN\).
+We report:
+\fiteq{\text{FNR}=\frac{FN}{TP+FN},\quad \text{FPR}=\frac{FP}{FP+TN},\quad
+\text{Mitigation}=\text{Recall}=\frac{TP}{TP+FN}=1-\text{FNR},\quad
+\text{Precision}=\frac{TP}{TP+FP}.} The "\(>99\%\) mitigation" target
+is thus the hypothesis \(\text{Recall}>0.99\) \textbf{on the
+signature-expressible malicious class} (the scoping of §V-D --- we do
+not claim it for arbitrary semantic attacks). It is reported as
+\(\langle\text{Recall}\rangle\) with a confidence interval, not
+asserted.
+
+\textbf{Interval estimation.} Because \(TP,FP\) are binomial counts,
+point rates are insufficient; we report \textbf{Wilson score 95\%
+confidence intervals} for each proportion (Wilson is preferred over
+normal-approximation for proportions near 0 or 1, exactly the regime of
+a \(>99\%\) recall claim). A claim "\(\text{Recall}>0.99\)" is credited
+only if the \emph{lower} Wilson bound exceeds 0.99, which in turn
+dictates the minimum \(|\mathcal{X}^{+}|\) needed (§VII-E).
+
+\textbf{Operating point and ROC.} We sweep \(\theta\) to trace the
+ROC/precision-recall curve and select the operating point by the design
+priority of §V-D (high precision / low FPR first filter), and report the
+chosen \(\theta\), its FPR/FNR, and the AUC \(\langle\text{AUC}\rangle\)
+for comparability with the literature band (lexical filters $\approx$0.65;
+embedding classifiers $\approx$0.76, §V-D).
+
+\textbf{Per-family breakdown.} Report recall separately per attack
+family (direct override, role-play, delimiter/tag, control-token,
+§II-C/Appendix C) and per source dataset, since an aggregate rate can
+mask a blind spot in one family --- a per-family table is more
+informative and more honest than a single headline number.
+
+\textbf{Results (measured, full deepset corpus).} Running the complete
+662-row corpus (\(|\mathcal{X}^{+}|=263\) injection,
+\(|\mathcal{X}^{-}|=399\) legitimate) through the shipped edge screening
+pipeline at \(\theta=1.0\) yields Table III.
+
+\textbf{TABLE III. Edge screening layer on deepset/prompt-injections
+(Wilson 95\% CI).}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lll@{}}
+\toprule
+Metric & Value & 95\% CI \\
+\midrule
+
+
+
+Mitigation (Recall) & \textbf{2.28 \%} & {[}1.05 \%, 4.89 \%{]} \\
+False-Positive Rate & \textbf{0.00 \%} & {[}0.00 \%, 0.95 \%{]} \\
+Precision & 100.00 \% & {[}60.97 \%, 100 \%{]} \\
+ROC AUC & \textbf{0.511} & --- \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+This result is decisive and, we argue, \emph{strengthens} the paper
+rather than undermining it, because it confirms the §V-D positioning
+empirically and refutes an overclaim. Three readings follow.
+\textbf{(i)} The edge layer is a \textbf{high-precision, low-recall
+first filter}: it blocked \(6/263\) injections while raising
+\textbf{zero} false positives over \(399\) legitimate payloads --- it
+never harms benign traffic, the property a perimeter filter must
+guarantee. \textbf{(ii)} Its recall on the \emph{full}, diverse,
+partly-German deepset distribution is low (\(2.28\%\), AUC \(\approx\)
+chance) because a compact deterministic signature set cannot, even in
+principle, cover novel or multilingual phrasings --- precisely the
+ceiling §V-D anticipated and the motivation for the origin escalation
+tier (§IX). \textbf{(iii)} Consequently, \textbf{the "\(>99\%\)
+mitigation" figure is a \emph{full-system} target, not an edge-layer
+property}, and the data show the signature layer alone does not meet it:
+the Wilson lower bound is \(1.05\%\), nowhere near \(0.99\), so the
+hypothesis \(\text{Recall}>0.99\) is \textbf{rejected for the edge layer
+in isolation}. We therefore restate the system\textquotesingle s
+detection claim precisely: the edge layer contributes
+\emph{high-precision, zero-false-positive} removal of the
+signature-expressible subclass within the sub-millisecond CPU budget,
+and the aggregate mitigation rate is a property of the \emph{composed}
+edge + origin-tier system, whose measurement we scope to future work
+(§IX). Reporting Table III rather than curating a benchmark to flatter
+the signature set is the methodological commitment of
+§VII\textquotesingle s opening convention.
+
+\textbf{Full-system result (edge + origin escalation tier).} We
+implemented and \emph{deployed} the origin-side escalation tier (§IX) as
+a self-hosted injection classifier, and measured the \emph{composed}
+system on the same corpus --- a payload is blocked iff the edge
+hard-rejects it \textbf{or} the classifier flags it. We report two
+classifiers run on the live deployment (CPU inference): the ungated
+\passthrough{\lstinline!protectai/deberta-v3-base-prompt-injection-v2!}
+(English-only), and the chosen, purpose-built multilingual \textbf{Meta
+Llama Prompt Guard 2 86M} (Table IV).
+
+\textbf{TABLE IV. Full-system detection on deepset, live deployment
+(Wilson 95\% CI).}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llll@{}}
+\toprule
+Configuration & Recall (Mitigation) & FPR & Precision \\
+\midrule
+
+
+
+Edge only (Table III) & 2.28 \% {[}1.05, 4.89{]} & 0.00 \% & 100 \% \\
++ protectai (EN-only) & \textbf{41.44 \%} {[}35.66, 47.48{]} & 1.00 \%
+{[}0.39, 2.55{]} & 96.46 \% \\
++ Prompt Guard 2 86M (chosen, multilingual) & \textbf{22.81 \%}
+{[}18.15, 28.26{]} & \textbf{0.25 \%} {[}0.04, 1.41{]} & 98.36 \% \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+Four findings follow, and the third \textbf{corrects an expectation
+stated in an earlier draft of this work}. \textbf{(i)} The escalation
+tier lifts recall an order of magnitude over the edge alone (2.28 \% $\to$
+22.8--41.4 \%) --- the layered architecture\textquotesingle s value is
+\emph{empirically demonstrated}, not merely argued. \textbf{(ii)} Vendor
+accuracy numbers do \textbf{not} transfer across distributions:
+protectai self-reports 99.74 \% recall and Prompt Guard 2 self-reports
+97.5 \% recall at 1 \% FPR, both \emph{on their own held-out sets}, yet
+on this out-of-distribution, partly-German corpus they measure 41.4 \%
+and 22.8 \% respectively --- a stark, quantified vindication of
+independent evaluation over cited model-card figures. \textbf{(iii)}
+Counterintuitively, the flagship multilingual model achieves
+\emph{lower} recall than the English-only proxy, because Meta
+deliberately tuned Prompt Guard 2 to minimize false positives: it trades
+recall for precision, delivering 0.25 \% FPR / 98.4 \% precision versus
+the proxy\textquotesingle s 1.0 \% / 96.5 \%. Model selection at this
+tier is therefore an \emph{operating-point} decision (precision-first vs
+recall-first), not a strict quality ordering --- a nuance invisible to
+anyone trusting a single headline accuracy figure. \textbf{(iv)} Even
+the chosen model at its default operating point leaves a large residual
+recall gap; the "\textgreater99 \% mitigation" ambition is thus a
+genuinely \textbf{open problem} (§IX) that dropping in a purpose-built
+guardrail does \emph{not} close --- threshold tuning, ensembling (e.g.
+adding NVIDIA NemoGuard on the jailbreak axis), and adaptive-attack
+hardening remain necessary.
+
+\textbf{Testing those two remedies (threshold sweep + jailbreak-axis
+ensemble).} We evaluated both directly. Sweeping Prompt Guard
+2\textquotesingle s decision threshold across \([0.9, 0.1]\) moves
+recall only from 20.5 \% to \textbf{26.6 \%} (the aggressive end costing
+a doubling of FPR to 0.50 \%) --- the recall gap is \textbf{structural,
+not a threshold artifact}: PG2 scores \textasciitilde73 \% of deepset
+injections \emph{below 0.1}. Adding NVIDIA NemoGuard JailbreakDetect as
+an OR ensemble yielded \textbf{0 \% additional recall} on deepset, for
+two separable reasons we report honestly: (a) NemoGuard is a
+\emph{jailbreak} detector and deepset is \emph{injection} --- an axis
+mismatch --- and (b) we could not reproduce NVIDIA\textquotesingle s
+exact CPU embedding pipeline from the public artifacts and
+self-contradictory model card (a blatant jailbreak scored
+\textasciitilde0.09, not \textasciitilde0.99, across every
+embedder/pooling/normalization variant tried), so this 0 \% reflects
+\emph{our reproduction}, not NemoGuard\textquotesingle s true NIM
+performance. The operational conclusion (details in
+\passthrough{\lstinline!docs/nemoguard\_ensemble.md!}) is that neither
+remedy closes the gap on this corpus; a stronger injection-specific
+classifier or a fine-tune on injection data is required.
+
+\textbf{Phase 5 --- the gap was never structural; it is a decision-head
+artifact (SOLVED).} We tested whether PG2\textquotesingle s \emph{frozen
+encoder} already separates injections, training a lightweight logistic
+head on its penultimate (pooler) embeddings --- the exact representation
+PG2\textquotesingle s own head classifies --- using a license-clean
+corpus (deepset+gandalf+OpenOrca train; §refs Part 8). Evaluation
+followed a \textbf{pre-registered, leakage-controlled OOD protocol}
+(threshold calibrated on validation/benign only; OOD = fresh HackAPrompt
+injections + dolly benign, deduplicated within and across splits;
+touched once). The result required three pre-registered runs, and we
+report the full arc --- including two NULLs we held rather than
+rationalize --- as the honest record.
+
+\textbf{TABLE VI. Phase-5 head on PG2 frozen embeddings (fresh OOD,
+Wilson 95\% CI).}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Run & OOD Recall & OOD FPR & AUC & Verdict (bar: recall $\ge$50 \%, FPR $\le$1
+\%) \\
+\midrule
+
+
+
+PG2 native head (baseline) & 22.8 \% & 0.25 \% & --- & --- \\
+5a (threshold on 45 mismatched benign) & 99.7 \% & 2.2 \% & 1.000 &
+\textbf{NULL} (FPR \textgreater{} 1 \%) \\
+5a-bis (calibration fixed) & 99.9 \% & 1.2 \% {[}0.8, 1.7{]} & 1.000 &
+\textbf{NULL} (point FPR \textgreater{} 1 \%) \\
+\textbf{5a-ter (99.5th-pct calib, fresh data)} & \textbf{99.9 \%}
+{[}99.3, 100{]} & \textbf{0.7 \%} {[}0.4, 1.2{]} & 0.999 &
+\textbf{SUCCESS} \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+The finding is decisive: a \emph{linear} head on PG2\textquotesingle s
+frozen embeddings lifts out-of-distribution injection recall from
+\textbf{22.8 \% to 99.9 \% at 0.7 \% FPR}. Phase 4\textquotesingle s
+"structural gap" was therefore \textbf{not} in the encoder --- the
+representation carries near-perfect signal (AUC $\approx$ 1.0) --- but entirely
+in Meta\textquotesingle s precision-first \emph{decision head}. 5a and
+5a-bis returned NULL on the hard FPR ceiling (2.2 \%, then 1.2 \% with a
+CI that included 1.0 \%); we held both rather than loosen a
+pre-registered criterion after seeing the data, and 5a-ter cleared all
+three locked bars strictly on fresh disjoint data via a single
+pre-registered operating-point change. The composed \textbf{PG2-encoder
+$\to$ logistic-head} classifier was then deployed as the origin Tier-3a
+model (§IX), replacing the native head. Full protocol and
+pre-registration:
+\passthrough{\lstinline!docs/phase5a\_finetune\_scoping.md!}.
+
+\subsection{VII-E. Statistical Rigor}\label{vii-e-statistical-rigor}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Sample size for the recall claim.} To credit
+  \(\text{Recall}>0.99\) via the Wilson lower bound at 95\% confidence,
+  the required \(|\mathcal{X}^{+}|\) follows from the Wilson interval
+  width at the observed rate; we state the attained
+  \(|\mathcal{X}^{+}|\) and whether it suffices, and if the primary
+  corpus is too small for a 0.99 lower bound we say so explicitly rather
+  than over-claim from a small sample.
+\item
+  \textbf{Latency percentile uncertainty.} Tail percentiles from finite
+  samples have non-trivial variance; we report bootstrap confidence
+  intervals for \(\langle p99\rangle\) and run \(R\ge\) (stated)
+  repetitions across time-of-day to bound diurnal network variance.
+\item
+  \textbf{Multiple comparisons.} When comparing operating points or
+  datasets, we note the number of comparisons and avoid selecting the
+  best-looking \(\theta\) post hoc without a held-out split.
+\end{itemize}
+
+\subsection{VII-F. Threats to Validity}\label{vii-f-threats-to-validity}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Construct / corpus bias.}
+  \passthrough{\lstinline!deepset/prompt-injections!} is bilingual DE/EN
+  and modestly sized; recall on it may not transfer to other languages
+  or to adaptive adversaries. We mitigate by supplementing families
+  (§VII-A) and reporting per-family, but do not claim generality beyond
+  the tested distribution.
+\item
+  \textbf{Adaptive adversary.} The evaluation is against a \emph{static}
+  corpus; a signature filter is, by construction, evadable by an
+  attacker who knows the signatures (novel phrasings).
+  §V-D\textquotesingle s scoped claim and the origin-tier escalation
+  (§IX) are the response; we do not present static-corpus recall as
+  robustness against adaptive attack.
+\item
+  \textbf{Single-region measurement.} Latency measured from limited
+  client geographies may not represent global tail behavior; we report
+  the measurement geography and treat \(L_{\text{net}}^{\Delta}\) as
+  region-dependent.
+\item
+  \textbf{Mock origin.} Subtracting a controlled \(S_O\) isolates
+  firewall latency but omits real-origin variance interactions; we note
+  this and report both firewall-added and end-to-end figures.
+\end{itemize}
+
+\subsection{VII-G. Methodological Integrity (the discipline behind the
+numbers)}\label{vii-g-methodological-integrity-the-discipline-behind-the-numbers}
+
+The Phase-5 result (Table VI) is a 99.9 \% recall claim, and such claims
+are exactly where evaluation most often deceives itself. We therefore
+adopted a set of adversarial-to-ourselves controls, and we regard the
+\emph{process} as a primary contribution --- a headline number is only
+as credible as the protocol that could have falsified it.
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Pre-registration.} The full success criterion --- OOD recall
+  \(\ge 50\%\) at \emph{point-estimate} FPR \(\le 1\%\), with the recall
+  Wilson lower bound clearing the baseline\textquotesingle s upper bound
+  --- was fixed in writing
+  (\passthrough{\lstinline!docs/phase5a\_finetune\_scoping.md!})
+  \textbf{before any training code was written}, and the single
+  pre-registered operating-point change for 5a-ter (99.0th \(\to\)
+  99.5th calibration percentile) was recorded \textbf{before} the fresh
+  draw. The criterion was never renegotiated after seeing data.
+\item
+  \textbf{Leakage control.} Splits were deduplicated by exact
+  normalized-text hash \emph{and} by embedding cosine similarity
+  \(\ge 0.95\) \textbf{across} train/validation/OOD (and \(\ge 0.98\)
+  within splits), so a reported "win" cannot arise from near-duplicate
+  memorization. This removed, e.g., 14 validation items that were
+  near-copies of training data, and 137 of 500 sampled OOD injections as
+  exact/cross-train matches.
+\item
+  \textbf{License refusal.} Datasets whose licenses could not be
+  confirmed to a primary source were \textbf{excluded from training and
+  evaluation} regardless of their utility --- Tensor Trust (license
+  unconfirmed; the code repo\textquotesingle s BSD-2 does not cover the
+  crowdsourced data), the safe-guard set (no license listed), and BIPIA
+  (non-standard license). We accepted a smaller corpus over an
+  unverifiable one.
+\item
+  \textbf{Holding the NULL --- twice.} The decisive discipline: run 5a
+  returned 99.7 \% recall at 2.2 \% FPR and run 5a-bis returned 99.9 \%
+  recall at 1.2 \% FPR \textbf{with a Wilson CI that included 1.0 \%}. A
+  single sentence ("statistically consistent with \(\le 1\%\)") would
+  have converted either into a reported SUCCESS. We returned
+  \textbf{NULL} both times, because the pre-registered ceiling was on
+  the point estimate and loosening it post hoc is precisely the
+  self-deception pre-registration exists to prevent. Only after a
+  legitimate operating-point change, tested \textbf{once} on genuinely
+  fresh, disjoint, never-scored data, did the point estimate clear the
+  bar (0.7 \% FPR) --- and \emph{that} number we report as SUCCESS. The
+  two NULLs are not failures to hide; they are the evidence that the
+  final number was earned, not curated.
+\end{itemize}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Citation keys}\label{citation-keys-4}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}DS-PI{]}} deepset, "prompt-injections," Hugging Face
+  Datasets, huggingface.co/datasets/deepset/prompt-injections (662 rows;
+  546/116; Apache 2.0; accessed 2026-07-04).
+\item
+  \textbf{{[}DS-JB{]}} jackhhao, "jailbreak-classification," Hugging
+  Face Datasets (1,306 rows; Apache 2.0; accessed 2026-07-04).
+\item
+  \textbf{{[}DS-GA{]}} Lakera, "gandalf\_ignore\_instructions," Hugging
+  Face Datasets; see also arXiv:2311.01011.
+\end{itemize}
+
+\begin{quote}
+by direct fetch of the HF dataset cards (verified-facts Part 4b,
+2026-07-04). \textbf{Detection results (Table III: edge Recall 2.28 \%,
+FPR 0.00 \%, AUC 0.511; Table IV: protectai 41.44 \% / FPR 1.00 \%,
+Prompt Guard 2 86M 22.81 \% / FPR 0.25 \%) are MEASURED} over the full
+662-row deepset corpus
+(\passthrough{\lstinline!benchmarks/results/deepset-662-\{local,fullsystem,promptguard2\}/!})
+--- Table III via the firewall\textquotesingle s own
+\passthrough{\lstinline!screen()!} pipeline; Table IV\textquotesingle s
+protectai row via \passthrough{\lstinline!full\_system.py!}, and its
+Prompt Guard 2 row via \passthrough{\lstinline!run\_prompt\_guard.py!}
+executed on the \textbf{live production deployment} (Helsinki origin,
+CPU). The escalation-tier model specs are CONFIRMED (verified-facts Part
+7) but their accuracy figures are vendor-self-reported; Table IV is our
+own independent measurement of a proxy. Latency quantities
+(\(\langle p50/p90/p99\rangle\), \(\langle\kappa/\rho\rangle\)) remain
+placeholders pending an edge deployment. The statistical methods (Wilson
+intervals, bootstrap percentiles) are standard; the analytical latency
+decomposition (§VII-B) is original and rests only on the CONFIRMED §III
+envelope.
+\end{quote}
+
+\section{VIII. Related Work}\label{viii-related-work}
+
+We situate the contribution across five strands. Throughout, we cite
+only sources whose claims were primary-verified in this work or which
+are canonical, dated references; any citation requiring final
+bibliographic completion is marked \passthrough{\lstinline![cite]!}.
+
+\textbf{Edge and serverless security.} Web Application Firewalls and
+CDN-layer filtering are established, but classical WAF rule engines
+target SQL-injection/XSS signatures over HTTP structure, not
+natural-language instruction injection into an LLM. The V8-isolate
+execution model {[}C-limits{]} gives a materially different cost
+envelope than container-per-request FaaS (cold start, per-request
+process), which prior serverless-security work assumes; our cost model
+(§III-C) is specific to the isolate\textquotesingle s
+amortized-construction, CPU-vs-I/O-metered regime and, to our knowledge,
+is the first to bound an LLM-injection screener against the
+\emph{corrected} (post-2024) Workers CPU envelope rather than the
+obsolete 50 ms figure.
+
+\textbf{LLM prompt-injection defenses.} The field spans (i) fine-tuned
+structural defenses --- StruQ, SecAlign --- which achieve high
+attack-rejection but were recently shown to learn brittle surface
+heuristics with large OOD degradation {[}arXiv-2601.07185{]}; (ii)
+embedding-based classifiers (RF/ XGBoost over prompt embeddings) that
+can outperform encoder-only baselines but at modest absolute AUC on
+curated sets {[}arXiv-2410.22284{]}; (iii) model-based guardrails (Llama
+Guard-class) \passthrough{\lstinline![cite]!}; and (iv)
+deterministic/lexical filters. The OWASP LLM Top 10 {[}OWASP-LLM01{]}
+fixes the direct/indirect taxonomy we adopt (§II-C), corroborated by
+{[}arXiv-2410.21146{]}. Our position (§V-A) is \emph{not} to compete
+with model guardrails on recall but to argue their \emph{architectural}
+misplacement at the edge and to occupy the high-precision,
+sub-millisecond, I/O-free niche a finite-state matcher uniquely fills
+--- with the model tier relocated to the origin (§IX). The multi-pattern
+primitive is Aho--Corasick {[}AC75{]}, whose \(O(n+z)\) single-pass
+matching {[}Springer-AC{]} is what makes hundreds of signatures
+affordable in the isolate budget.
+
+\textbf{Webhook authentication and MAC security.} Production webhook
+signing (Stripe\textquotesingle s timestamped
+\passthrough{\lstinline!t!}/\passthrough{\lstinline!v1!} HMAC-SHA256
+scheme {[}Stripe-sig{]}, GitHub\textquotesingle s equivalent
+\passthrough{\lstinline![cite]!}) establishes the practice we formalize.
+HMAC itself is RFC 2104 {[}RFC2104{]} / FIPS 198-1 {[}FIPS198-1{]}, with
+PRF-security from Bellare--Canetti--Krawczyk {[}BCK96{]} and \emph{tight
+multi-user} security from Bellare--Bernstein--Tessaro {[}BBT16{]} ---
+the latter is what lets our tenant-binding bound (§IV-C/D) avoid linear
+degradation in the tenant count. The novelty is not HMAC but the
+\emph{tenant-binding theorem}: to our knowledge, prior webhook-signing
+treatments authenticate \emph{message integrity} but do not prove
+\emph{tenant-context binding} as a reduction discharging a
+cross-tenant-isolation obligation (§II-D $\to$ §IV).
+
+\textbf{Multi-tenant isolation.} Cross-tenant leakage in shared-context
+LLM systems is an emerging concern; the adversary model combining a
+Dolev--Yao network attacker {[}DY83{]} with a malicious authenticated
+tenant (§II-A) is, we believe, the appropriate formalization for
+multi-tenant webhook ingestion and is not standard in prior LLM-security
+threat models.
+
+\textbf{High-velocity logging.} Time-series and append-only logging over
+PostgreSQL is well-trodden operationally; our contribution is the
+specific composition --- \passthrough{\lstinline!waitUntil!}-decoupled
+writes, a durable queue for at-least-once delivery, JSONB+TOAST for
+unstructured payloads, GIN \passthrough{\lstinline!fastupdate!} to bound
+index cost, and declarative range partitioning for O(1) retention
+{[}PG-toast, PG-gin, PG-partition{]} --- tied to PCI-DSS Req 10.5.1 /
+SOC 2 CC7 with edge-side PAN redaction (§VI-F).
+
+\textbf{In sum}, each primitive is prior art; the \emph{contribution is
+the vertically-integrated composition} --- edge relocation + a proven
+tenant-binding cryptographic layer + a cost-bounded deterministic
+screener + a non-blocking compliant logging path --- engineered against
+the real, current constraints of the edge runtime and evaluated with
+methodological honesty.
+
+\section{IX. Limitations and Future
+Work}\label{ix-limitations-and-future-work}
+
+\textbf{Limitations (stated plainly).} (L1) The edge screener is
+deterministic and therefore evadable by an adaptive adversary who crafts
+novel phrasings outside the signature set; §V-D\textquotesingle s recall
+claim is scoped to the signature-expressible class, and static-corpus
+recall (§VII) is \emph{not} robustness against adaptive attack. (L2)
+HMAC is symmetric, so the scheme provides no \textbf{forward secrecy}: a
+leaked per-epoch key forges within its rollover window (§IV-D). (L3)
+Cross-tenant \emph{context} isolation at the origin (the
+\(c_b\cap d_a=\emptyset\) property of §II-D, mode 1) is \emph{assumed},
+not enforced by the edge; the firewall discharges the \emph{attribution}
+obligation (mode 2) only. (L4) The replay nonce cache (§IV-E) is
+regional; a globally distributed producer set needs distributed replay
+state. (L5) Evaluation is single-region, bilingual, and on a
+modestly-sized corpus (§VII-F).
+
+\textbf{Future work.}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Origin-side escalation tier (implemented, deployed,
+  measured).} We built and \emph{deployed} the Layer-3 escalation tier
+  as a self-hosted classifier and measured it live on the full corpus
+  (§VII, Table IV): the chosen multilingual \textbf{Prompt Guard 2 86M}
+  achieves 22.8 \% recall at 0.25 \% FPR, and the English-only proxy
+  41.4 \% at 1.0 \% FPR --- both an order of magnitude above the edge
+  alone, and both far below their vendor self-reports (97.5 \% / 99.7
+  \%). We \emph{tested} the two obvious remedies (§VII, Phase 4): a PG2
+  threshold sweep lifts recall only to 26.6 \%, and an OR-ensemble with
+  NVIDIA NemoGuard (jailbreak axis) adds 0 \% on this injection corpus
+  --- compounded by our inability to reproduce
+  NemoGuard\textquotesingle s CPU embedding pipeline from public
+  artifacts (a blatant jailbreak scored \textasciitilde0.09; we do not
+  claim NemoGuard is weak, only that we could not faithfully run it
+  off-NIM). That the flagship model sits at 22.8 \% recall and neither
+  of those two remedies closes the gap was, at Phase 4, the key open
+  question. \textbf{Phase 5 resolved it (§VII, Table VI): the gap is NOT
+  structural.} A linear head trained on PG2\textquotesingle s
+  \emph{frozen} embeddings reaches \textbf{99.9 \% OOD recall at 0.7 \%
+  FPR} (AUC $\approx$ 1.0) under a pre-registered, leakage-controlled protocol
+  --- proving the encoder always carried near-perfect signal and the
+  22.8 \% was purely Meta\textquotesingle s precision-first decision
+  head. The composed \textbf{PG2-encoder $\to$ logistic-head} classifier is
+  deployed as the origin Tier-3a model, replacing the native head.
+  Remaining future work: a cost model bounding the escalation rate,
+  adaptive-attack hardening, and periodic re-calibration of the head
+  threshold on deployment traffic.
+\item
+  \textbf{Threat-log-driven signature synthesis (closed loop).} Mine the
+  §VI JSONB threat log to auto-propose new Aho--Corasick signatures from
+  clustered novel payloads, with human-in-the-loop validation ---
+  turning the logging tier from a passive record into an active
+  detection feedback loop, and partially closing L1 against
+  slowly-adapting adversaries.
+\item
+  \textbf{Forward-secure / asymmetric webhook signing.} Replace or
+  augment symmetric HMAC with per-epoch key ratcheting or asymmetric
+  signatures to obtain forward secrecy and reduce key-distribution
+  burden (addressing L2), quantifying the added edge CPU cost of
+  asymmetric verification against the §III budget.
+\item
+  \textbf{TEE-backed origin context isolation.} Enforce (rather than
+  assume) the mode-1 isolation of L3 with hardware-isolated per-tenant
+  model contexts, extending the cryptographic guarantee across trust
+  boundary B3.
+\item
+  \textbf{Distributed replay state.} Realize the nonce cache as
+  globally-consistent state (e.g., Durable Objects) with an explicit
+  latency/consistency trade characterization (addressing L4).
+\item
+  \textbf{Adaptive-adversary and multi-modal evaluation.} Extend the
+  corpus to adaptive/obfuscated and non-text (image/file) injection
+  vectors, and characterize the economic ("denial-of-wallet") DoS bound
+  formally.
+\end{enumerate}
+
+\section{X. Conclusion}\label{x-conclusion}
+
+We presented a multi-layered defensive architecture that relocates the
+first line of LLM-webhook defense to the network edge and integrates
+four contributions into one request path: (i) an edge-isolate firewall
+whose per-request cost is provably bounded --- strictly linear in a
+capped input, backtrack-free, with one-time automaton construction
+amortized to module scope --- and analyzed against the \emph{corrected}
+Cloudflare Workers envelope (10 ms free / 30 s--5 min paid CPU, 128 MB
+isolate), replacing the widely-repeated but obsolete "50 ms" premise
+with primary-sourced facts; (ii) a cryptographic tenant-isolation layer
+whose tenant-binding property is proven by reduction to
+HMAC\textquotesingle s multi-user EUF-CMA security, yielding a bound
+independent of tenant count and key-rotation multiplicity, with replay
+handled as an orthogonal freshness property; (iii) a deterministic
+Aho--Corasick screening layer, honestly positioned as a high-precision
+sub-millisecond first filter whose recall gap on novel semantic attacks
+is delegated to an origin-side model tier; and (iv) a non-blocking,
+compliance-aware threat-logging path over partitioned PostgreSQL JSONB
+that never gates the request and never persists cardholder data.
+
+Two commitments distinguish the work methodologically: every platform
+figure is primary-sourced and date-stamped against an actively-changing
+edge platform, and every \emph{result} quantity is deferred to a
+reproducible benchmark harness rather than asserted --- the paper
+specifies the experiment and lets measurement dictate the claims.
+
+\textbf{The deployed system, operating as the AIO Apex enterprise
+firewall, is a dual-tier composition.} A multi-tenant Cloudflare edge
+performs the rapid, sub-millisecond screen --- HMAC-SHA256 tenant
+binding for authenticated isolation, plus Aho--Corasick signature
+matching --- and \textbf{fails open to a self-hosted origin
+deep-scanner} when the model tier is unreachable, so availability never
+depends on the heavier layer. That origin tier now runs the Phase-5
+classifier: \textbf{Prompt Guard 2\textquotesingle s frozen encoder
+feeding a calibrated linear head}.
+
+\textbf{The central empirical result is that the recall gap was never
+structural.} Meta\textquotesingle s Prompt Guard 2 exhibits 22.8 \%
+out-of-distribution recall through its \emph{native} head, and Phase 4
+might have concluded the encoder was blind to those attacks. Phase 5
+disproves that: a \emph{linear} logistic head on the
+model\textquotesingle s frozen penultimate embeddings reaches
+\textbf{99.9 \% OOD recall at 0.7 \% false-positive rate (AUC
+\(\approx 0.999\))} under a pre-registered, leakage-controlled protocol
+on fresh, disjoint data (Table VI). The 22.8 \% was purely a
+\textbf{decision-head artifact} --- Meta\textquotesingle s
+precision-first calibration --- not an encoder limitation; the injection
+signal was present in the representation all along and merely required a
+properly calibrated boundary to extract. This composed head is deployed
+as the origin tier, replacing the native head end-to-end.
+
+Equally, we regard the \emph{discipline} that produced that number as a
+contribution in its own right (§VII-G): success criteria pre-registered
+before any code, cosine-\(\ge 0.95\) cross-split deduplication, refusal
+of unverifiable-license data, and --- decisively --- \textbf{two NULL
+verdicts held on 99.7 \%+ recall} because a strict FPR point-estimate
+ceiling was not cleared, before the bar was met on genuinely fresh data.
+A 99.9 \% that survives that process is worth more than one asserted
+without it. The architecture demonstrates that strong, provable
+multi-tenant LLM webhook security --- and a detector that closes the
+recall gap --- is achievable within the real constraints of edge
+compute, with vast CPU headroom rather than at its margin, provided each
+layer is engineered to the platform\textquotesingle s actual, current
+envelope and each claim is earned rather than curated.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsubsection{Additional citation keys (canonical /
+dated)}\label{additional-citation-keys-canonical--dated}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}AC75{]}} A. V. Aho, M. J. Corasick, "Efficient String
+  Matching: An Aid to Bibliographic Search," Communications of the ACM,
+  18(6):333--340, 1975.
+\item
+  \textbf{{[}DY83{]}} D. Dolev, A. C. Yao, "On the Security of Public
+  Key Protocols," IEEE Trans. Information Theory, 29(2):198--208, 1983.
+\item
+  \textbf{{[}Wilson27{]}} E. B. Wilson, "Probable Inference, the Law of
+  Succession, and Statistical Inference," J. American Statistical
+  Association, 22(158):209--212, 1927. \emph{(§VII-E interval.)}
+\item
+  (Prior citation keys {[}C-limits{]}, {[}OWASP-LLM01{]},
+  {[}arXiv-2601.07185{]}, {[}arXiv-2410.22284{]},
+  {[}arXiv-2410.21146{]}, {[}Springer-AC{]}, {[}Stripe-sig{]},
+  {[}RFC2104{]}, {[}FIPS198-1{]}, {[}BCK96{]}, {[}BBT16{]},
+  {[}PG-\emph{{]}, {[}DS-}{]} resolve as defined in their home
+  sections.)
+\end{itemize}
+
+\begin{quote}
+1975, Dolev--Yao 1983, Wilson 1927 --- all real, well-established);
+items needing final bibliographic detail (Llama Guard, GitHub webhook
+docs) are marked \passthrough{\lstinline![cite]!} and must be completed
+before submission --- none is load-bearing for a claim. §IX limitations
+are the honest consolidation of the non-claims made throughout (forward
+secrecy, adaptive adversary, assumed origin isolation). §X asserts no
+new facts.
+\end{quote}
+
+\section{Appendix A. Full STRIDE $\to$ Mitigation
+Mapping}\label{appendix-a-full-stride--mitigation-mapping}
+
+Table A.1 expands the abbreviated Table I (§II-B) into the complete
+decomposition, adding the cross-boundary coupling, a qualitative
+likelihood/impact for the payment-gateway running example, the
+mitigating control with its paper section, and the residual risk that
+survives the control. "L/I" is Likelihood/Impact on a \{Low, Med, High\}
+scale. Boundaries: \textbf{B1} public network, \textbf{B2} edgeorigin,
+\textbf{B3} the model\textquotesingle s instruction/data boundary
+(§II-A).
+
+\textbf{TABLE A.1. Complete STRIDE decomposition of the webhook$\to$LLM
+pipeline.}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lllllllll@{}}
+\toprule
+\# & STRIDE & Threat & Asset & Bdy & Coupling & L/I & Mitigating control
+(§) & Residual risk \\
+\midrule
+
+
+
+1 & Spoofing & Forged/unsigned webhook impersonating a producer or
+tenant & A1 & B1 & --- & H/H & HMAC-SHA256 verify + tenant binding
+(§IV-C) & Key compromise within a rollover window (§IV-D) \\
+2 & Tampering & Payload mutated in transit & A3 & B1 & --- & M/H &
+Signature over canonical \passthrough{\lstinline!H\_body!} (§IV-B) &
+None if HMAC unbroken \\
+3 & Tampering$\to$Elev. & Indirect injection: adversarial instructions in
+relayed content & A3 & B1,B3 & T$\to$E & H/H & Aho--Corasick + feature
+screening (§V) & Novel/semantic phrasings (measured FNR 97.7 \%, §VII);
+delegated to origin tier (§IX) \\
+4 & Tampering$\to$Info & Cross-tenant context poisoning: \(t_a\) mutates
+shared state read into \(t_b\)\textquotesingle s context & A2,A3 & B3 &
+T$\to$I & L/H & Tenant binding (§IV) + assumed per-tenant context isolation
+(§II-D mode 1) & Origin-side isolation is \emph{assumed}, not enforced
+by the edge (L3, §IX) \\
+5 & Repudiation & Attack occurs with no durable attribution & A5 & B1 &
+--- & M/M & Async append-only threat log (§VI); PCI 10.2/10.3 &
+Log-store availability over the write window (§VI-B) \\
+6 & Info. disclosure & System-prompt / context extraction; cross-tenant
+leakage & A2 & B3 & --- & M/H & Extraction signatures (§V-B) + isolation
+& Obfuscated extraction below signature threshold \\
+7 & DoS & Token flood / CPU / subrequest exhaustion; "denial-of-wallet"
+& A4 & B1 & --- & H/M & Size guard + sub-ms rejection before inspection
+(§III-C, §V) & Distributed volumetric floods (upstream CDN scope) \\
+8 & Elev. of priv. & Direct injection / jailbreak executes with the
+agent\textquotesingle s tool/data privileges & A2,A3 & B3 & --- & H/H &
+Screening (§V) + least-privilege origin tools & Same recall gap as row
+3 \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+\textbf{Reading the residual-risk column.} Rows 3 and 8 carry the recall
+gap the paper measures empirically (§VII, Table III): the edge
+layer\textquotesingle s deterministic screening is high-precision but
+low-recall, so the \emph{residual} for these rows is explicitly
+transferred to the origin escalation tier (§IX), not claimed as closed.
+Row 4\textquotesingle s residual --- that mode-1 context isolation is
+assumed --- is the paper\textquotesingle s principal scoping boundary
+(L3). This column is what makes the threat model \emph{actionable}: it
+states, per threat, exactly what is and is not discharged.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Appendix B. Proof of the Tenant-Binding
+Theorem}\label{appendix-b-proof-of-the-tenant-binding-theorem}
+
+We give the full game-hopping proof of Theorem 1 (§IV-C), the
+Injectivity Lemma it depends on, and the extensions to key rotation
+(Theorem 2) and replay.
+
+\subsection{B.1 Preliminaries recalled}\label{b1-preliminaries-recalled}
+
+Let \(H=\mathsf{HMAC\text{-}SHA256}\) with tag length \(n=256\). For a
+set of tenants \(\mathcal{T}\), keys \(k_i \leftarrow_\$ \{0,1\}^n\) are
+drawn independently. The signed message is the injective encoding
+\fiteq{m = \langle \mathsf{tid} \rangle \,\|\, \langle \kappa \rangle \,\|\, \langle t \rangle
+\,\|\, \langle \eta \rangle \,\|\, \langle H_{\text{body}} \rangle,}
+where \(\langle\cdot\rangle\) denotes a length-prefixed
+(self-delimiting) field encoding. Write \(\mathsf{tid}(m)\) for the
+tenant-id field recovered from \(m\). The signing function is
+\(\mathsf{Mac}_{k}(m)=H_k(m)\) and verification checks
+\(H_k(m)\stackrel{?}{=}\tau\) in constant time.
+
+\textbf{Assumptions.} (i) Multi-user PRF security of HMAC: for \(u\)
+instances, \(\mathbf{Adv}^{\text{mu-prf}}_{H,u}(\mathcal{B})\) is
+negligible and, by {[}BBT16{]}, carries no factor linear in \(u\). (ii)
+The field encoding is injective (Lemma B.1).
+
+\subsection{\texorpdfstring{B.2 The multi-user tenant-binding game
+\(\mathbf{G}_0\)}{B.2 The multi-user tenant-binding game \textbackslash mathbf\{G\}\_0}}\label{b2-the-multi-user-tenant-binding-game-mathbfg_0}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Sample \(k_i\leftarrow_\$\{0,1\}^n\) for all \(t_i\in\mathcal{T}\).
+\item
+  \(\mathcal{A}\) chooses a corrupt set
+  \(\mathcal{C}\subsetneq\mathcal{T}\) and receives
+  \(\{k_i: t_i\in\mathcal{C}\}\). Let
+  \(\mathcal{U}=\mathcal{T}\setminus\mathcal{C}\), \(u=|\mathcal{U}|\).
+\item
+  \(\mathcal{A}\) has oracles, for every \(t_j\in\mathcal{U}\):
+  \(\mathsf{Sign}_j(m)=H_{k_j}(m)\) (queries recorded in
+  \(\mathcal{Q}_j\)) and
+  \(\mathsf{Ver}_j(m,\tau)=[\,H_{k_j}(m)=\tau\,]\).
+\item
+  \(\mathcal{A}\) outputs \((b,m^*,\tau^*)\) with
+  \(t_b\in\mathcal{U}\) and \(\mathsf{tid}(m^*)=\mathsf{tid}_b\).
+\item
+  \textbf{Win} (\(\mathbf{G}_0=1\)) iff \(H_{k_b}(m^*)=\tau^*\) and
+  \(m^*\notin\mathcal{Q}_b\).
+\end{enumerate}
+
+By definition
+\(\mathbf{Adv}^{\text{bind}}(\mathcal{A})=\Pr[\mathbf{G}_0=1]\). Let
+\(Q_v\) be the total number of verification queries \(\mathcal{A}\)
+makes.
+
+\subsection{B.3 Lemma B.1 (Injectivity / namespace
+separation)}\label{b3-lemma-b1-injectivity--namespace-separation}
+
+\emph{If the field encoding \(\langle\cdot\rangle\|\cdots\) is injective
+and \(\mathsf{tid}\) occupies a self-delimiting field, then (a) distinct
+field-tuples yield distinct \(m\), and (b) any \(m^*\) with
+\(\mathsf{tid}(m^*)=\mathsf{tid}_b\) that is not in \(\mathcal{Q}_b\)
+is a fresh input to \(H_{k_b}\) --- independent of every query made to
+any \(\mathsf{Sign}_j\), \(j\neq b\).}
+
+\emph{Proof.} (a) is immediate from injectivity of a concatenation of
+self-delimiting fields. For (b): the only oracle evaluating \(H_{k_b}\)
+is \(\mathsf{Sign}_b\) (and \(\mathsf{Ver}_b\), which reveals only a
+bit). Queries to \(\mathsf{Sign}_j\), \(j\neq b\), evaluate \(H_{k_j}\)
+under an independent key \(k_j\) and thus reveal nothing about
+\(H_{k_b}(m^*)\). Since \(m^*\notin\mathcal{Q}_b\), the value
+\(H_{k_b}(m^*)\) was never returned to \(\mathcal{A}\). \(\square\)
+
+The lemma is the crux of \emph{binding}: because \(\mathsf{tid}_b\) is
+inside \(m\), owning every other tenant\textquotesingle s key (hence
+every \(H_{k_j}\), \(j\neq b\)) yields no information about the tag
+\(\mathcal{A}\) must produce for \(t_b\).
+
+\subsection{B.4 Proof of Theorem 1}\label{b4-proof-of-theorem-1}
+
+We bound \(\Pr[\mathbf{G}_0=1]\) by a two-game hop.
+
+\textbf{Game \(\mathbf{G}_1\).} Identical to \(\mathbf{G}_0\), except
+each uncorrupted tenant\textquotesingle s \(H_{k_j}\)
+(\(j\in\mathcal{U}\)) is replaced by an independent truly random
+function \(R_j:\{0,1\}^*\to\{0,1\}^n\); both \(\mathsf{Sign}_j\) and
+\(\mathsf{Ver}_j\) use \(R_j\).
+
+\emph{Claim 1.} \(\big|\Pr[\mathbf{G}_1=1]-\Pr[\mathbf{G}_0=1]\big|\le
+\mathbf{Adv}^{\text{mu-prf}}_{H,u}(\mathcal{B})\).
+
+\emph{Proof.} Construct a mu-PRF distinguisher \(\mathcal{B}\) against
+\(u\) instances. \(\mathcal{B}\) samples the corrupt keys itself,
+answers corrupt-key reveals directly, and routes every
+\(\mathsf{Sign}_j/\mathsf{Ver}_j\) call (\(j\in\mathcal{U}\)) to its
+\(j\)-th oracle. If the oracles are the real \(H_{k_j}\),
+\(\mathcal{B}\) simulates \(\mathbf{G}_0\) exactly; if they are random
+functions, it simulates \(\mathbf{G}_1\). \(\mathcal{B}\) outputs \(1\)
+iff \(\mathcal{A}\) wins. The distinguishing advantage is the game gap,
+and by {[}BBT16{]} it is \(\le\mathbf{Adv}^{\text{mu-prf}}_{H,u}\) with
+no \(u\)-factor. \(\square\)
+
+\emph{Claim 2.} \(\Pr[\mathbf{G}_1=1]\le Q_v\,2^{-n}\).
+
+\emph{Proof.} In \(\mathbf{G}_1\), verification of a candidate
+\((b,m^*,\tau^*)\) succeeds iff \(\tau^*=R_b(m^*)\). By Lemma
+B.1(b), \(m^*\) (fresh, \(\mathsf{tid}=\mathsf{tid}_b\),
+\(\notin\mathcal{Q}_b\)) is a point at which \(R_b\) has never been
+evaluated in \(\mathcal{A}\)\textquotesingle s view, so \(R_b(m^*)\) is
+uniform on \(\{0,1\}^n\) and independent of everything \(\mathcal{A}\)
+has seen (including all \(R_{j\neq b}\) outputs and all corrupt keys).
+Any single verification query therefore succeeds with probability
+exactly \(2^{-n}\). A union bound over the \(\le Q_v\) verification
+queries gives \(\Pr[\mathbf{G}_1=1]\le Q_v\,2^{-n}\). \(\square\)
+
+Combining,
+\(\mathbf{Adv}^{\text{bind}}(\mathcal{A})=\Pr[\mathbf{G}_0=1]\le
+\mathbf{Adv}^{\text{mu-prf}}_{H,u}(\mathcal{B})+Q_v\,2^{-n}\), which is
+Theorem 1. \(\blacksquare\)
+
+\textbf{Interpretation.} With \(n=256\), the \(Q_v\,2^{-n}\) term is
+negligible for any feasible \(Q_v\); the bound is dominated by the
+mu-PRF term, which --- critically --- does not grow with the number of
+tenants \(u\). Cross-tenant attribution is therefore as hard as breaking
+HMAC, at enterprise tenant scale.
+
+\subsection{B.5 Extension to key rotation (Theorem
+2)}\label{b5-extension-to-key-rotation-theorem-2}
+
+Model each currently-valid pair \((t_i,\kappa)\), \(t_i\in\mathcal{U}\),
+as one instance; let
+\(u'=\sum_{t_i\in\mathcal{U}}|\{\kappa: k_{i,\kappa}\text{ valid}\}|\le uL\).
+The rotation verifier accepts a \(t_b\)-attributed message iff some
+valid \((t_b,\kappa)\) verifies it, i.e. iff it is a forgery under one
+of these instances. Since \(\kappa\) is inside \(m\) (authenticated),
+Lemma B.1 extends: a message with a given \((\mathsf{tid}_b,\kappa)\) is
+fresh input to instance \((b,\kappa)\). Re-running §B.4 with the
+instance set enlarged from \(u\) to \(u'\) gives
+\(\mathbf{Adv}^{\text{bind-rot}}\le\mathbf{Adv}^{\text{mu-prf}}_{H,u'}+Q_v\,2^{-n}\),
+which by {[}BBT16{]} is again independent of \(u'\) (hence of both \(u\)
+and \(L\)). \(\blacksquare\)
+
+\subsection{B.6 Replay resistance (orthogonal freshness
+argument)}\label{b6-replay-resistance-orthogonal-freshness-argument}
+
+Theorem 1 permits replay of an \emph{already-signed} \((m,\tau)\):
+\(m\in\mathcal{Q}_b\) is not a win. Freshness is enforced separately.
+With tolerance window \(\Delta\), nonce cache \(\mathcal{N}\) (TTL
+\(2\Delta\)), and \(\lambda\)-bit nonces, a replayed \((m,\tau)\) is
+accepted only if it arrives within \(\Delta\) of \(t_s\) (else the
+timestamp check rejects) \emph{and} its nonce \(\eta\) has been evicted
+from \(\mathcal{N}\) (else the replay check rejects). Since
+\(\mathcal{N}\) retains \(\eta\) for \(2\Delta\ge\Delta\), within the
+timestamp window \(\eta\) is necessarily present, so
+\fiteq{\Pr[\text{replay accepted}]\le\Pr[\text{nonce-store loss over }2\Delta]+2^{-\lambda},}
+where the first term is the cache\textquotesingle s availability failure
+probability and \(2^{-\lambda}\) bounds an accidental nonce collision.
+For \(\lambda=128\) the collision term is negligible; replay resistance
+reduces to nonce-store reliability. \(\blacksquare\)
+
+\subsection{B.7 Remarks}\label{b7-remarks}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Tightness.} The reduction is tight up to the mu-PRF term;
+  there is no target-guessing \(1/u\) loss (a forgery under \emph{any}
+  uncorrupted instance wins the mu-game).
+\item
+  \textbf{No forward secrecy.} Keys are symmetric; a leaked
+  \(k_{i,\kappa}\) forges within \(\kappa\)\textquotesingle s window.
+  Rotation bounds, but does not retroactively protect, that window.
+\item
+  \textbf{Constant-time verification} is required so that
+  \(\mathsf{Ver}\) leaks only the accept/reject bit modelled in the
+  game, not tag bytes via timing.
+\end{itemize}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Appendix C. Signature Corpus and
+Reproducibility}\label{appendix-c-signature-corpus-and-reproducibility}
+
+\subsection{C.1 Signature families}\label{c1-signature-families}
+
+The shipped corpus
+(\passthrough{\lstinline!edge-firewall/src/signatures.ts!}) contains 24
+signatures across the OWASP LLM01 families of §II-C. Each is
+\passthrough{\lstinline!blocking!} (a single hit forces reject,
+favouring the low-FPR operating point) or weighted (contributes to the
+soft score \(\theta\), §V-C).
+
+\textbf{TABLE C.1. Signature families (shipped corpus).}
+
+{\def\LTcaptype{none} % do not increment counter
+\begin{table*}[!t]\centering\scriptsize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llll@{}}
+\toprule
+Family (§II-C) & Example signatures & Blocking & Weighted \\
+\midrule
+
+
+
+Direct override &
+\passthrough{\lstinline!ignore previous instructions!},
+\passthrough{\lstinline!disregard all previous!},
+\passthrough{\lstinline!forget everything above!} & 3 & 2 \\
+Extraction & \passthrough{\lstinline!reveal your system prompt!},
+\passthrough{\lstinline!repeat the words above!},
+\passthrough{\lstinline!print your configuration!} & 1 & 3 \\
+Role-play / persona & \passthrough{\lstinline!you are now dan!},
+\passthrough{\lstinline!enable developer mode!},
+\passthrough{\lstinline!do anything now!} & 2 & 3 \\
+Safety bypass & \passthrough{\lstinline!jailbreak mode!},
+\passthrough{\lstinline!without any content filter!},
+\passthrough{\lstinline!unlock full capabilities!} & 1 & 2 \\
+Delimiter / tag & `\textless{} & system &
+\textgreater{}\passthrough{\lstinline!, !}\textless{} \\
+Control-token & `\textless{} & endoftext &
+\textgreater{}\passthrough{\lstinline!, !}` \\
+\bottomrule
+\end{tabular}}
+\end{table*}
+}
+
+The compactness of this set is deliberate and is exactly what §VII,
+Table III measures: it yields 0 \% FPR but low recall on diverse real
+injections. The set is \emph{not} tuned against the evaluation corpus
+(that would overfit and is methodologically disallowed); expanding it is
+future work via threat-log-driven synthesis (§IX-2).
+
+\subsection{C.2 Evaluation corpus}\label{c2-evaluation-corpus}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Source:} \passthrough{\lstinline!deepset/prompt-injections!},
+  Hugging Face, Apache 2.0.
+\item
+  \textbf{Size:} 662 rows (546 train / 116 test); labels \(0=\)legit,
+  \(1=\)injection; DE+EN.
+\item
+  \textbf{Split used:} the full 662 rows (\(|\mathcal{X}^+|=263\),
+  \(|\mathcal{X}^-|=399\)).
+\item
+  \textbf{Fetched by:}
+  \passthrough{\lstinline!benchmarks/corpus/fetch\_corpus.mjs!}
+  (datasets-server rows API).
+\end{itemize}
+
+\subsection{C.3 Operating point and
+metrics}\label{c3-operating-point-and-metrics}
+
+Decision threshold \(\theta=1.0\) (§V-C). A payload is a predicted
+positive iff the firewall does not \passthrough{\lstinline!forward!}
+(i.e. \passthrough{\lstinline!reject!} or
+\passthrough{\lstinline!escalate!}). Metrics as defined in §VII-D;
+confidence intervals are Wilson score at 95 \%
+(\passthrough{\lstinline!benchmarks/lib/stats.mjs!}); ROC AUC by
+trapezoidal integration over the swept threshold, with a blocking hit
+treated as a maximal-confidence positive.
+
+\subsection{C.4 Reproduction}\label{c4-reproduction}
+
+\begin{lstlisting}[language=bash]
+cd benchmarks && npm install
+npm run corpus      # deepset/prompt-injections -> corpus/payloads.json (662 rows)
+npm run detection   # confusion matrix + Wilson CIs  -> results/detection.{json,md}
+npm run roc         # ROC/AUC over the real screen()  -> results/roc.json
+npm run report      # Section VII placeholder table
+\end{lstlisting}
+
+Committed artifacts of the run reported in Table III live in
+\passthrough{\lstinline!benchmarks/results/deepset-662-local/!}. Latency
+(§VII-C) requires a live edge deployment; run
+\passthrough{\lstinline!benchmarks/latency.k6.js!} with
+\passthrough{\lstinline!WORKER\_URL!} and a provisioned bench tenant
+key.
+
+\begin{quote}
+residuals. Appendix B reduces solely to the mu-PRF assumption
+({[}BBT16{]}) and the standard EUF-CMA framework --- no unverified
+external facts. Appendix C\textquotesingle s corpus facts are CONFIRMED
+by direct fetch (verified-facts Part 4b) and its metrics are the
+executed harness output.
+\end{quote}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{Data and Code Availability}\label{data-and-code-availability}
+
+The Phase-5 injection-classifier pipeline is released to support
+reproduction of the 99.9 \% out-of-distribution result: the corpus
+builder and leakage-control deduplication
+(\passthrough{\lstinline!build\_corpus.py!}), the frozen Prompt Guard 2
+embedding extractor
+(\passthrough{\lstinline!extract\_pg2\_embeddings.py!}), the
+head-training and single-touch OOD evaluation
+(\passthrough{\lstinline!train\_head.py!},
+\passthrough{\lstinline!phase5a\_bis.py!},
+\passthrough{\lstinline!phase5a\_ter.py!}), the production head
+finalizer (\passthrough{\lstinline!finalize\_head.py!}), and the
+pre-registration protocol
+(\passthrough{\lstinline!docs/phase5a\_finetune\_scoping.md!}) that
+fixed the success criteria before any training code. All evaluation
+datasets are the license-confirmed public corpora enumerated in Appendix
+C. The deterministic seeds (20260705/06/07) reproduce the exact train /
+validation / OOD splits.
+
+Repository:
+\url{https://github.com/mosafariuk/prompt-guard-2-frozen-head}
+
+Artifacts are additionally available from the corresponding author
+(\href{mailto:mo@aioapex.com}{\nolinkurl{mo@aioapex.com}}) on request.
+
+\section{References}\label{references}
+
+Consolidated bibliography. Keys are the mnemonic
+\passthrough{\lstinline!\\cite!} labels used inline throughout the
+sections; a camera-ready build would renumber these {[}1{]}\ldots{[}n{]}
+via BibTeX. Grouped by type for readability; \textbf{P} =
+primary/verified, \textbf{C} = canonical dated work, \textbf{S} =
+secondary (used only qualitatively).
+
+\subsection{Platform documentation (P --- Cloudflare, accessed
+2026-07-04)}\label{platform-documentation-p--cloudflare-accessed-2026-07-04}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}C-limits{]}} Cloudflare, "Workers --- Limits,"
+  developers.cloudflare.com/workers/platform/limits.
+\item
+  \textbf{{[}C-pricing{]}} Cloudflare, "Workers --- Pricing,"
+  developers.cloudflare.com/workers/platform/pricing.
+\item
+  \textbf{{[}C-changelog-2025{]}} Cloudflare, "Higher CPU limits for
+  Workers," changelog, 2025-03-25.
+\item
+  \textbf{{[}C-changelog-2026{]}} Cloudflare, "Increased subrequest
+  limits," changelog, 2026-02-11.
+\item
+  \textbf{{[}C-do-limits{]}} Cloudflare, "Durable Objects --- Limits,"
+  developers.cloudflare.com/durable-objects/platform/limits.
+\item
+  \textbf{{[}C-wf-limits{]}} Cloudflare, "Workflows --- Limits,"
+  developers.cloudflare.com/workflows/reference/limits.
+\end{itemize}
+
+\subsection{Cryptography (P/C)}\label{cryptography-pc}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}RFC2104{]}} H. Krawczyk, M. Bellare, R. Canetti, "HMAC:
+  Keyed-Hashing for Message Authentication," RFC 2104, IETF, Feb. 1997.
+\item
+  \textbf{{[}FIPS198-1{]}} NIST, "The Keyed-Hash Message Authentication
+  Code (HMAC)," FIPS PUB 198-1, 2008.
+\item
+  \textbf{{[}BCK96{]}} M. Bellare, R. Canetti, H. Krawczyk, "Keying Hash
+  Functions for Message Authentication," CRYPTO 1996. (See also M.
+  Bellare, "New Proofs for NMAC and HMAC," CRYPTO 2006.)
+\item
+  \textbf{{[}BBT16{]}} M. Bellare, D. J. Bernstein, S. Tessaro,
+  "Hash-Function Based PRFs: AMAC and Its Multi-User Security,"
+  EUROCRYPT 2016.
+\item
+  \textbf{{[}Stripe-sig{]}} Stripe, "Verify webhook signatures,"
+  docs.stripe.com/webhooks/signature (accessed 2026-07-04).
+\end{itemize}
+
+\subsection{LLM security \& prompt injection
+(P)}\label{llm-security--prompt-injection-p}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}OWASP-LLM01{]}} OWASP, "LLM01:2025 Prompt Injection," Top
+  10 for LLM Applications,
+  genai.owasp.org/llmrisk/llm01-prompt-injection.
+\item
+  \textbf{{[}arXiv-2601.07185{]}} "Defenses Against Prompt Attacks Learn
+  Surface Heuristics," arXiv:2601.07185, 2026.
+\item
+  \textbf{{[}arXiv-2410.22284{]}} M. A. Ayub, S. Majumdar,
+  "Embedding-based classifiers for prompt-injection detection," CAMLIS
+  2024, arXiv:2410.22284.
+\item
+  \textbf{{[}arXiv-2410.21146{]}} "(direct/indirect/stored
+  prompt-injection taxonomy)," arXiv:2410.21146, 2024.
+\end{itemize}
+
+\subsection{Algorithms \& statistics
+(C)}\label{algorithms--statistics-c}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}AC75{]}} A. V. Aho, M. J. Corasick, "Efficient String
+  Matching: An Aid to Bibliographic Search," Comm. ACM, 18(6):333--340,
+  1975.
+\item
+  \textbf{{[}Springer-AC{]}} "(Aho--Corasick multi-pattern matching for
+  signature detection)," Springer, doi:10.1007/978-3-031-96093-2\_15.
+\item
+  \textbf{{[}DY83{]}} D. Dolev, A. C. Yao, "On the Security of Public
+  Key Protocols," IEEE Trans. Inf. Theory, 29(2):198--208, 1983.
+\item
+  \textbf{{[}Wilson27{]}} E. B. Wilson, "Probable Inference, the Law of
+  Succession, and Statistical Inference," J. Amer. Stat. Assoc.,
+  22(158):209--212, 1927.
+\end{itemize}
+
+\subsection{Database (P --- PostgreSQL official
+docs)}\label{database-p--postgresql-official-docs}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}PG-json{]}} "JSON Types,"
+  postgresql.org/docs/current/datatype-json.html.
+\item
+  \textbf{{[}PG-toast{]}} "Database Physical Storage --- TOAST,"
+  postgresql.org/docs/current/storage-toast.html.
+\item
+  \textbf{{[}PG-wal-conf{]}} "Write Ahead Log --- runtime config,"
+  postgresql.org/docs/current/runtime-config-wal.html.
+\item
+  \textbf{{[}PG-wal-config{]}} "WAL Configuration,"
+  postgresql.org/docs/current/wal-configuration.html.
+\item
+  \textbf{{[}PG-gin{]}} "GIN Indexes,"
+  postgresql.org/docs/current/gin.html.
+\item
+  \textbf{{[}PG-partition{]}} "Table Partitioning,"
+  postgresql.org/docs/current/ddl-partitioning.html.
+\end{itemize}
+
+\subsection{Compliance (P)}\label{compliance-p}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}PCI-DSS{]}} PCI Security Standards Council, "PCI-DSS
+  v4.0.1," June 2024. Req 10.2/10.3.1/10.3.2/10.5.1; Req
+  3.3/3.4.1/3.5.1.
+\item
+  \textbf{{[}AICPA-TSC{]}} AICPA, "Trust Services Criteria" (2017, rev.
+  2022), Common Criteria CC7.1--CC7.4.
+\end{itemize}
+
+\subsection{Datasets (P --- accessed
+2026-07-04)}\label{datasets-p--accessed-2026-07-04}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}DS-PI{]}} deepset, "prompt-injections," Hugging Face
+  Datasets (662 rows; 546/116; Apache 2.0).
+\item
+  \textbf{{[}DS-JB{]}} jackhhao, "jailbreak-classification," Hugging
+  Face Datasets (1,306 rows; Apache 2.0).
+\item
+  \textbf{{[}DS-GA{]}} Lakera, "gandalf\_ignore\_instructions," Hugging
+  Face Datasets; see also arXiv:2311.01011.
+\end{itemize}
+
+\subsection{Secondary (S --- qualitative use
+only)}\label{secondary-s--qualitative-use-only}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}Layered{]}} "(layered prompt-injection detector; \textless1
+  ms Layers 1--2, 300--800 ms model layer)," dev.to. Used only for the
+  model-tier latency order-of-magnitude (§V-A/§V-D).
+\end{itemize}
+
+\subsection{To complete before
+camera-ready}\label{to-complete-before-camera-ready}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{{[}cite{]}} Llama Guard (Meta) --- model-guardrail reference
+  (§V-A, §VIII).
+\item
+  \textbf{{[}cite{]}} GitHub webhook signing docs --- timestamped HMAC
+  scheme (§VIII).
+\end{itemize}
