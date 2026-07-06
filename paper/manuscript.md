@@ -1749,7 +1749,7 @@ that fixed the success criteria before any training code. All evaluation dataset
 license-confirmed public corpora enumerated in Appendix C. The deterministic seeds
 (20260705/06/07) reproduce the exact train / validation / OOD splits.
 
-Repository: \url{https://github.com/mosafariuk/prompt-guard-2-frozen-head}  % AIO Apex — set final URL
+Repository: <https://github.com/mosafariuk/prompt-guard-2-frozen-head>
 
 Artifacts are additionally available from the corresponding author (mo@aioapex.com) on
 request.
