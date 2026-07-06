@@ -12,6 +12,14 @@ codebase it describes, operating as the **AIO Apex** enterprise firewall.
 > **99.9% recall at 0.7% FPR (AUC ≈ 0.999)** — the injection signal was in the
 > representation all along. The composed classifier is deployed as the origin deep-scan tier.
 
+<p align="center">
+  <img src="benchmarks/results/phase5a/recall_vs_fpr.png" width="820"
+       alt="OOD recall vs. false-positive rate: PG2's native head sits at 22.8% recall, while the frozen-embedding linear head reaches 99.9% at 0.7% FPR, clearing the 1% ship-gate ceiling; Phase 5a and 5a-bis are held NULL just right of the ceiling.">
+</p>
+
+<p align="center"><em>Recall vs. FPR (Wilson 95% CI). The 1% ceiling separates the SUCCESS zone (5a-ter)
+from the two runs held NULL. Regenerate: <code>python benchmarks/plot_results.py</code>.</em></p>
+
 ## The result, and how it was earned
 
 The number is trustworthy *because of the process that produced it* — a pre-registered,
