@@ -1,0 +1,21 @@
+{
+  "name": "edge-llm-firewall",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Edge interception layer (Cloudflare Worker) for multi-tenant LLM webhook securitization. Implements the paper's Sections III-VI: bounded-CPU screening, HMAC-SHA256 tenant binding, and non-blocking threat logging.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/workers-types": "^4.20260101.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0",
+    "wrangler": "^3.90.0"
+  }
+}

@@ -1,0 +1,91 @@
+%% IEEEtran skeleton for the manuscript. The body is produced MECHANICALLY from
+%% manuscript.md via pandoc (see paper/ieee/README.md) rather than hand-converted,
+%% so the math/tables/proofs carry over faithfully. This file is the correct,
+%% compilable wrapper; it was NOT compiled in the authoring environment (no LaTeX
+%% toolchain present) — run the build in paper/ieee/README.md to produce the PDF.
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsthm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{textcomp}
+\usepackage{upquote}
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\pandocbounded}[1]{#1}
+\providecommand{\passthrough}[1]{#1}
+\providecommand{\textquotesingle}{'}
+% Shrink-to-fit for wide display equations so they never overflow a column.
+\newcommand{\fiteq}[1]{\par\vspace{2pt}\noindent\centerline{%
+  \resizebox{\ifdim\width>0.96\linewidth 0.96\linewidth\else \width\fi}{!}{%
+  \ensuremath{\displaystyle #1}}}\vspace{2pt}\par}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage{cite}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
+
+% Compact code font so the Fig.1 ASCII dataflow fits a single column.
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,breakatwhitespace=false,%
+  columns=fullflexible,keepspaces=true,frame=single,xleftmargin=0pt}
+
+\begin{document}
+
+\title{Multi-Layered Defensive Architecture and Webhook Securitization for LLM
+Deployment in Multi-Tenant Enterprise Systems}
+
+\author{\IEEEauthorblockN{Mohammad Safari}
+\IEEEauthorblockA{AIO Apex\\
+Brighton, United Kingdom\\
+Email: mo@aioapex.com}}
+
+\maketitle
+
+\begin{abstract}
+Large Language Models exposed through webhook interfaces in multi-tenant enterprise
+platforms inherit a hostile attack surface in which a single unauthenticated or
+adversarial request can trigger prompt injection, cross-tenant data leakage, or
+spoofed event delivery. This paper presents a dual-tier defensive architecture. A
+multi-tenant V8-isolate edge (i)~authenticates every webhook via HMAC-SHA256 signatures
+binding a tenant identifier into the signed message---providing EUF-CMA tenant-context
+integrity with a multi-user bound independent of tenant count and key-rotation
+multiplicity---and (ii)~screens payloads with deterministic single-pass Aho--Corasick
+matching in a sub-millisecond CPU budget, \emph{failing open} to a self-hosted origin
+deep-scanner for availability; interception events are (iii)~logged to a partitioned
+PostgreSQL JSONB store on a non-blocking path. We formalize the threat model with STRIDE
+extended by cross-boundary coupling and correct a widely-repeated misconception about
+edge CPU limits. Our central empirical finding concerns the origin tier: Meta Prompt
+Guard~2's 22.8\% out-of-distribution recall is a \emph{decision-head artifact}, not an
+encoder limitation---a linear head on its frozen embeddings reaches \textbf{99.9\% OOD
+recall at 0.7\% false-positive rate (AUC $\approx$ 0.999)} under a pre-registered,
+leakage-controlled protocol on fresh disjoint data, and is deployed as the production
+classifier. We treat the evaluation discipline as a first-class contribution:
+pre-registered criteria, cosine-$\ge$0.95 cross-split deduplication, refusal of
+unverifiable-license data, and two NULL verdicts held on 99.7\%+ recall before the
+strict false-positive ceiling was met.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LLM security, prompt injection, multi-tenant isolation, edge computing, HMAC,
+webhook authentication, PostgreSQL, JSONB, STRIDE.
+\end{IEEEkeywords}
+
+%% -----------------------------------------------------------------------------
+%% BODY. Generate body.tex from manuscript.md (see README.md), then:
+\input{body}
+%% -----------------------------------------------------------------------------
+
+%% Bibliography: convert paper/10_references.md to refs.bib, or use \thebibliography.
+% \bibliographystyle{IEEEtran}
+% \bibliography{refs}
+
+\end{document}

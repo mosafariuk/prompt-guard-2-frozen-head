@@ -1,0 +1,50 @@
+{
+  "mode": "local-screening",
+  "provenance": "deepset/prompt-injections (Hugging Face), Apache 2.0. Fetched via datasets-server. train=546, test=116, total=662. label: 1=injection, 0=legit.",
+  "n": 662,
+  "malicious": 263,
+  "benign": 399,
+  "confusion": {
+    "tp": 6,
+    "fp": 0,
+    "tn": 399,
+    "fn": 257
+  },
+  "recall": {
+    "p": 0.022813688212927757,
+    "lower": 0.010496687312282614,
+    "upper": 0.048869870239911024
+  },
+  "precision": {
+    "p": 1,
+    "lower": 0.6096657119861439,
+    "upper": 1
+  },
+  "fpr": {
+    "p": 0,
+    "lower": 0,
+    "upper": 0.009535907336165543
+  },
+  "fnr": {
+    "p": 0.9771863117870723,
+    "lower": 0.9511301297600889,
+    "upper": 0.9895033126877174
+  },
+  "perFamily": {
+    "direct_override": {
+      "recall": 0.11320754716981132,
+      "tp": 6,
+      "total": 53
+    },
+    "other": {
+      "recall": 0,
+      "tp": 0,
+      "total": 204
+    },
+    "roleplay": {
+      "recall": 0,
+      "tp": 0,
+      "total": 6
+    }
+  }
+}

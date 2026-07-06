@@ -1,0 +1,17 @@
+{
+  "name": "edge-firewall-benchmarks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Latency + detection benchmark suite emitting paper-ready Section VII tables.",
+  "scripts": {
+    "corpus": "node corpus/fetch_corpus.mjs",
+    "detection": "tsx detection.mjs",
+    "roc": "tsx roc.mjs",
+    "report": "node report.mjs",
+    "latency": "k6 run latency.k6.js"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

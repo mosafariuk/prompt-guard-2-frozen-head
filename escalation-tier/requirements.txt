@@ -1,0 +1,8 @@
+# Pin ranges for reproducibility; lock exact versions in a real deployment.
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30,<0.35
+transformers>=4.44,<5
+torch>=2.4
+sentencepiece>=0.2          # deberta-v3 tokenizer
+protobuf>=4                 # sentencepiece dependency for some tokenizers
+pydantic>=2.7,<3

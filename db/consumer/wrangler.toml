@@ -1,0 +1,21 @@
+# Queue consumer Worker. UNLIKE the edge firewall, this worker MAY use heavier
+# deps (postgres.js) and nodejs_compat, because it is off the latency-critical
+# path (paper Section VI-B). It exists to keep the edge isolate lean.
+
+name = "threat-log-consumer"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Consume the queue the firewall produces to.
+[[queues.consumers]]
+queue = "threat-log"
+max_batch_size = 100          # batch inserts amortize per-row WAL/RTT (Section VI-D)
+max_batch_timeout = 5         # seconds; flush partial batches promptly
+max_retries = 5               # at-least-once; dedup handled by ON CONFLICT
+dead_letter_queue = "threat-log-dlq"
+
+# Hyperdrive pools + accelerates the Postgres connection from the edge.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "REPLACE_WITH_HYPERDRIVE_ID"   # provisioned by terraform/

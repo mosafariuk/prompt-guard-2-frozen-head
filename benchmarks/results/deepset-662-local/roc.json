@@ -1,0 +1,37 @@
+{
+  "auc": 0.5114068441064639,
+  "roc": [
+    {
+      "fpr": 0,
+      "tpr": 0,
+      "threshold": null
+    },
+    {
+      "fpr": 0,
+      "tpr": 0.011406844106463879,
+      "threshold": 1000000
+    },
+    {
+      "fpr": 0,
+      "tpr": 0.015209125475285171,
+      "threshold": 1.2
+    },
+    {
+      "fpr": 0,
+      "tpr": 0.022813688212927757,
+      "threshold": 0.6
+    },
+    {
+      "fpr": 1,
+      "tpr": 1,
+      "threshold": 0
+    },
+    {
+      "fpr": 1,
+      "tpr": 1,
+      "threshold": null
+    }
+  ],
+  "n": 662,
+  "provenance": "deepset/prompt-injections (Hugging Face), Apache 2.0. Fetched via datasets-server. train=546, test=116, total=662. label: 1=injection, 0=legit."
+}

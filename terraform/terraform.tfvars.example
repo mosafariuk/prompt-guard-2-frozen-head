@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in. NEVER commit real secrets; prefer
+# TF_VAR_* env vars or a secrets manager for the sensitive values.
+
+cloudflare_account_id = "your-cloudflare-account-id"
+# export TF_VAR_cloudflare_api_token=... (do not put secrets in this file)
+
+origin_url = "https://origin.internal.example.com/webhook"
+# export TF_VAR_origin_shared_secret=...
+
+# Database
+db_master_username        = "tfadmin"
+# export TF_VAR_db_master_password=...
+db_subnet_ids             = ["subnet-aaaa", "subnet-bbbb"]
+db_vpc_security_group_ids = ["sg-cccc"]
+
+# Optional overrides
+# max_body_bytes           = 131072
+# replay_tolerance_seconds = 300
+# db_instance_class        = "db.r6g.large"

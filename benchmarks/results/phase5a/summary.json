@@ -1,0 +1,6 @@
+{
+  "train": "n=2110 inj=979 benign=1131 sources=['deepset', 'gandalf', 'openorca']",
+  "val": "n=102 inj=57 benign=45 sources=['deepset']",
+  "ood_test": "n=862 inj=363 benign=499 sources=['dolly', 'hackaprompt']",
+  "seed": 20260705
+}

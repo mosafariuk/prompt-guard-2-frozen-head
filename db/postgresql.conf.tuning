@@ -1,0 +1,81 @@
+# ============================================================================
+# postgresql.conf tuning for the high-velocity JSONB threat log (Section VI-D).
+#
+# Scope: these settings target a DEDICATED log database (or instance). Several
+# trade durability-latency for throughput in ways that are ONLY acceptable
+# because (a) the log has no cross-row invariants and (b) the queue's
+# at-least-once retry (Section VI-B) recovers the small tail lost on a crash.
+# DO NOT apply synchronous_commit=off etc. to a transactional tenant-data DB.
+#
+# Provenance tags:
+#   [VERIFIED] = primary-sourced from postgresql.org/docs (verified-facts Part 4)
+#   [PRACTICE] = standard PostgreSQL tuning guidance, not a paper factual claim
+# ============================================================================
+
+# --- WAL durability vs throughput -------------------------------------------
+# [VERIFIED] Removes the per-commit flush wait. Risks losing the last few hundred
+# ms of committed rows on a crash (max delay 3x wal_writer_delay) but creates NO
+# database inconsistency (runtime-config-wal.html). Acceptable for a log; the
+# queue redelivers most lost rows.
+synchronous_commit = off
+
+# [VERIFIED] Group commit: delay a WAL flush so more transactions flush together.
+# Units are microseconds. Active only when >= commit_siblings concurrent txns.
+commit_delay = 100
+commit_siblings = 5           # [VERIFIED] default is 5
+
+# [PRACTICE] Compress full-page images in WAL to cut WAL volume/IO on write-heavy
+# workloads. (wal_compression is standard practice; not among the paper's
+# primary-verified claims — included as engineering guidance.)
+wal_compression = on
+
+# [VERIFIED-adjacent] full_page_writes provides torn-page protection by logging
+# each page's full content on first modification after a checkpoint
+# (runtime-config-wal.html). Keep ON for crash safety; it interacts with
+# checkpoint frequency below (frequent checkpoints => more full-page images).
+full_page_writes = on
+
+# [PRACTICE] Larger WAL write buffer reduces flush frequency under burst inserts.
+wal_buffers = 16MB
+
+# --- Checkpoint tuning ------------------------------------------------------
+# [VERIFIED] Checkpoints begin every checkpoint_timeout OR when max_wal_size is
+# about to be exceeded (wal-configuration.html). Widen both so sustained insert
+# bursts do not trigger frequent checkpoints (each of which, with full_page_writes
+# on, inflates WAL). Defaults are 5min / 1GB; we raise them for throughput.
+checkpoint_timeout = 15min
+max_wal_size = 16GB
+min_wal_size = 2GB
+
+# [VERIFIED] Spread checkpoint I/O across 90% of the interval to avoid write
+# stalls. 0.9 is the documented recommended maximum (wal-configuration.html).
+checkpoint_completion_target = 0.9
+
+# --- Memory -----------------------------------------------------------------
+# [PRACTICE] ~25% of system RAM is the long-standing starting point for
+# shared_buffers on a dedicated server; effective_cache_size ~50-75% informs the
+# planner. Sized here for an example 32 GB host — tune to the actual box.
+shared_buffers = 8GB
+effective_cache_size = 24GB
+
+# --- GIN pending list (Section VI-D) ----------------------------------------
+# [VERIFIED] Global default for the fastupdate pending list; the per-index
+# WITH (gin_pending_list_limit=...) in 001 overrides it for the features index.
+# Larger => fewer, bulkier flushes to the main GIN structure (gin.html).
+gin_pending_list_limit = 8MB
+
+# --- Autovacuum for append-only, high-insert tables -------------------------
+# [PRACTICE] Insert-heavy partitions need frequent ANALYZE (for the planner and,
+# on modern PG, to flush GIN pending lists via autovacuum) but little UPDATE/DELETE
+# vacuuming. Make autovacuum more aggressive on this workload.
+autovacuum = on
+autovacuum_naptime = 30s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+autovacuum_max_workers = 6
+
+# --- Aggressive option (documented, OFF by default) -------------------------
+# UNLOGGED partitions skip WAL entirely for maximum insert throughput but are
+# TRUNCATED on crash recovery. Viable ONLY if the queue is treated as the durable
+# source of truth and some loss is tolerable. Enable per-partition, not globally.
+#   ALTER TABLE threat_log_YYYYMMDD SET UNLOGGED;   -- consider for the hot day only

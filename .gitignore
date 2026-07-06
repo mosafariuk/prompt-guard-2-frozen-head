@@ -1,0 +1,24 @@
+# dependencies & virtual envs
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# tool caches / build intermediates
+.wrangler/
+dist/
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+
+# OS
+.DS_Store
+
+# fetched datasets (reproduced by benchmarks/build_corpus.py; keep the sample)
+benchmarks/corpus/payloads.json
+
+# original task prompt (not project content)
+primary_doc.md

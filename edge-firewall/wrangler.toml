@@ -1,0 +1,50 @@
+# Cloudflare Worker configuration for the Edge LLM Firewall.
+# Full layered system: edge screening (§III-V) + on-prem deep-scan tier (§IX).
+
+name = "edge-llm-firewall"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+# nodejs_compat intentionally NOT enabled: only WebCrypto + standard Web APIs.
+
+# Public firewall entrypoint. A Cloudflare-managed custom domain (auto DNS + cert).
+# Distinct hostname from the origin deep-scan (ai-firewall.aioapex.com) to avoid a
+# proxy loop. Declarative here so future deploys reconcile it.
+[[routes]]
+pattern = "firewall.aioapex.com"
+custom_domain = true
+
+# account_id is set at deploy time via CLOUDFLARE_ACCOUNT_ID env (kept out of VCS).
+
+# --- CPU rail (§III-C): [limits] cpu_ms is a PAID-plan feature. On Free plan the
+# default 10ms CPU applies, which already dwarfs our sub-millisecond screening
+# cost (§V-F). Re-add on a paid plan:
+#   [limits]
+#   cpu_ms = 50
+
+# --- KV: per-tenant HMAC keys (§IV). IDs filled by `wrangler kv namespace create`.
+[[kv_namespaces]]
+binding = "TENANT_KEYS"
+id = "93417b6f8f18444da03ede11fa6a4c38"
+
+# --- KV: replay nonce cache (§IV-E).
+[[kv_namespaces]]
+binding = "NONCE_CACHE"
+id = "f4223ed0805e45959ef4834f766d866e"
+
+# --- Threat-log Queue (§VI-B) is OMITTED here: Queues require Workers Paid.
+# On the paid plan, add:
+#   [[queues.producers]]
+#   binding = "THREAT_LOG_QUEUE"
+#   queue = "threat-log"
+# The code treats the queue as optional (logging is skipped if unbound).
+
+[vars]
+# On-prem deep-scan tier (Tier-3a). Different hostname than the Worker route to
+# avoid a proxy loop (§ deploy topology).
+DEEPSCAN_URL = "https://ai-firewall.aioapex.com/v1/deep-scan"
+MAX_BODY_BYTES = "131072"            # N_max = 128 KiB (§III-C)
+REPLAY_TOLERANCE_SECONDS = "300"     # Delta (§IV-E; Stripe default)
+SCORE_THRESHOLD = "1.0"              # edge soft-score threshold theta (§V-C)
+
+# DEEPSCAN_SECRET (the B2 shared secret = the deep-scan service's X-Edge-Auth)
+# is a SECRET, set via:  wrangler secret put DEEPSCAN_SECRET
